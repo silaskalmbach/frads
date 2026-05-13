@@ -1843,6 +1843,111 @@ class FivePhaseMethod(PhaseMethod):
                 + sun_scale * diag_cdr
                 + cdf_scale * diag_cdf)
 
+    def calculate_sensor(
+        self,
+        sensor: str,
+        bsdf,
+        time: datetime,
+        dni: float,
+        dhi: float,
+        sky_scale: float = 1.0,
+        sun_scale: float = 1.0,
+    ) -> np.ndarray:
+        """Per-timestep Five-Phase Method sensor illuminance calculation.
+
+        Implements the canonical 5PM sensor formula::
+
+            result = sky_scale * (V*T*D*S - Vd*T*Dd*Sd)  # Klems-diffuse
+                   + sun_scale * (Cds*Ssun)               # direct sun specular
+
+        (There is no Cdf term for sensors -- the window-visibility-blob path
+        is only meaningful per-pixel in an image, not at a point.)
+
+        Args:
+            sensor: Sensor name (key into ``self.sensor_window_matrices`` etc.).
+            bsdf: dict ``{window_name: matrix_key}`` or list of matrix keys
+                (one per window, same order as ``config.model.windows``).
+            time: datetime for this timestep.
+            dni: Direct normal irradiance [W/m^2].
+            dhi: Diffuse horizontal irradiance [W/m^2].
+            sky_scale: Multiplier on the Klems-diffuse contribution.
+            sun_scale: Multiplier on the direct-sun specular contribution.
+
+        Returns:
+            ndarray of illuminance values [lux] for the sensor points.
+        """
+        weights = [47.4, 119.9, 11.6]
+
+        sky_mfactor = int(self.config.settings.sky_basis[-1])
+        sun_mfactor = int(self.config.settings.sun_basis[-1])
+
+        sky_matrix = self.get_sky_matrix(time, dni, dhi)
+        _wea_str = self.wea_header + str(WeaData(time, dni, dhi))
+
+        smx_d = pr.gendaymtx(
+            _wea_str.encode(), outform="d", mfactor=sky_mfactor,
+            header=False, sun_only=True,
+        )
+        nrows_d = BASIS_DIMENSION.get(f"r{sky_mfactor}", 145) + 1
+        direct_sky_matrix = load_binary_matrix(
+            smx_d, nrows=nrows_d, ncols=1, ncomp=3, dtype="d"
+        )
+        direct_sky_matrix_sparse = to_sparse_matrix3(direct_sky_matrix)
+
+        smx_s = pr.gendaymtx(
+            _wea_str.encode(), outform="d", mfactor=sun_mfactor,
+            header=False, sun_only=True, onesun=True,
+        )
+        nrows_s = BASIS_DIMENSION.get(f"r{sun_mfactor}", 5165) + 1
+        direct_sun_sky = load_binary_matrix(
+            smx_s, nrows=nrows_s, ncols=1, ncomp=3, dtype="d"
+        )
+        direct_sun_sky_sparse = to_sparse_matrix3(direct_sun_sky)
+
+        # res3: standard 3PM (V * T * D * S) summed over windows
+        res3 = np.zeros((self.sensor_senders[sensor].yres, 1))
+        for idx, _name in enumerate(self.config.model.windows):
+            _bsdf_key = bsdf[idx] if isinstance(bsdf, list) else bsdf[_name]
+            _bsdf = self.config.model.materials.matrices[_bsdf_key].matrix_data
+            res3 += matrix_multiply_rgb(
+                self.sensor_window_matrices[sensor].array[idx],
+                _bsdf,
+                self.daylight_matrices[_name].array,
+                sky_matrix,
+                weights=weights,
+            )
+
+        # res3d: direct component via sparse Vd*T*Dd*Sd
+        res3d = np.zeros((self.sensor_senders[sensor].yres, 1))
+        for idx, _name in enumerate(self.config.model.windows):
+            _bsdf_key = bsdf[idx] if isinstance(bsdf, list) else bsdf[_name]
+            _bsdf = self.config.model.materials.matrices[_bsdf_key].matrix_data
+            _res_d = np.zeros((self.sensor_senders[sensor].yres, 1))
+            for c, w in enumerate(weights):
+                td = np.dot(
+                    csr_matrix(_bsdf[:, :, c]),
+                    self.daylight_direct_matrices[_name].array[c],
+                )
+                tds = td.dot(direct_sky_matrix_sparse[c][:, :1])
+                vtds = self.sensor_window_direct_matrices[sensor].array[idx][c].dot(tds)
+                if hasattr(vtds, "toarray"):
+                    vtds = vtds.toarray()
+                _res_d += w * vtds
+            res3d += _res_d
+
+        # rescd: direct sun component via high-res sun coefficients
+        rescd = np.zeros((self.sensor_senders[sensor].yres, 1))
+        for c, w in enumerate(weights):
+            cds = self.sensor_sun_direct_matrices[sensor].array[c].dot(
+                direct_sun_sky_sparse[c][:, :1]
+            )
+            if hasattr(cds, "toarray"):
+                cds = cds.toarray()
+            rescd += w * cds
+
+        result = sky_scale * (res3 - res3d) + sun_scale * rescd
+        return result.flatten()
+
     def calculate_view_from_wea(self, view: str):
         logger.info("Step 1/2: Generating sky matrix from wea")
         sky_matrix = self.get_sky_matrix_from_wea(
