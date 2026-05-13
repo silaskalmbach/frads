@@ -78,13 +78,19 @@ class EnergyPlusSetup:
         nproc: int = 1,
         initialize_radiance: bool = True,
         output_directory: str = "./",
+        radiance_method: str = "3phase",
     ):
         """Class for setting up and running EnergyPlus simulations.
 
         Args:
             epmodel: EnergyPlusModel object
             weather_file: Weather file path. (default: None)
-            enable_radiance: If True, enable Radiance for Three-Phase Method. (default: False)
+            enable_radiance: If True, enable Radiance for the radiance method
+                selected via ``radiance_method``. (default: False)
+            radiance_method: ``"3phase"`` (default) or ``"5phase"``. Selects
+                which PhaseMethod subclass is instantiated for each zone when
+                ``enable_radiance`` is True. Previously hard-coded to
+                ThreePhaseMethod.
 
         Examples:
             >>> epsetup = EnergyPlusSetup(epmodel, weather_file="USA_CA_Oakland.Intl.AP.724930_TMY3.epw")
@@ -107,9 +113,22 @@ class EnergyPlusSetup:
             self.rconfigs = {
                 k: fr.WorkflowConfig.from_dict(v) for k, v in self.rmodels.items()
             }
-            # Default to Three-Phase Method
+            method_norm = radiance_method.lower().replace("-", "")
+            if method_norm in ("3phase", "threephase"):
+                workflow_cls = fr.ThreePhaseMethod
+                method_setting = "3phase"
+            elif method_norm in ("5phase", "fivephase"):
+                workflow_cls = fr.FivePhaseMethod
+                method_setting = "5phase"
+            else:
+                raise ValueError(
+                    f"Unknown radiance_method {radiance_method!r}; "
+                    "use '3phase' or '5phase'."
+                )
+            for cfg in self.rconfigs.values():
+                cfg.settings.method = method_setting
             self.rworkflows = {
-                k: fr.ThreePhaseMethod(v) for k, v in self.rconfigs.items()
+                k: workflow_cls(v) for k, v in self.rconfigs.items()
             }
             if initialize_radiance:
                 self.initialize_radiance(nproc=nproc)
