@@ -657,18 +657,34 @@ class SunMatrix(Matrix):
                 inform = "f"
                 xres = self.sender.xres
                 yres = self.sender.yres
-            modifier = pr.RcModifier()
-            modifier.modifier_path = modifier_file
-            modifier.xres = xres
-            modifier.yres = yres
-            matrix = pr.rcontrib(
-                self.sender.content,
-                octree_file,
-                [modifier],
+            # pyradiance >=1.1.5 removed the standalone RcModifier class and
+            # the top-level rcontrib() helper.  The replacement API is
+            # pr.Rcontrib(...).add_modifier(...).__call__().  We use the new
+            # API directly so that frads stays compatible with the current
+            # pyradiance release.
+            #
+            # ViewSender mode (inform='f') needs both -x and -y at the global
+            # rcontrib level (not just per-modifier) to inform rcontrib of the
+            # input ray-image dimensions.  The new Rcontrib class only emits
+            # -y in __init__, so we splice -x into the params list ahead of
+            # construction.
+            params_global = list(parameters)
+            if xres is not None:
+                params_global = ["-x", str(xres)] + params_global
+            rc = pr.Rcontrib(
+                inp=self.sender.content,
+                octree=octree_file,
+                yres=yres,
                 inform=inform,
                 outform="d",
-                params=parameters,
+                params=params_global,
             )
+            rc.add_modifier(
+                modifier_path=modifier_file,
+                xres=xres,
+                yres=yres,
+            )
+            matrix = rc()
         if radmtx:
             return matrix
         _array = load_binary_matrix(
