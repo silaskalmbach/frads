@@ -1657,19 +1657,33 @@ class FivePhaseMethod(PhaseMethod):
         with open(self.cdmap_oct, "wb") as wtr:
             wtr.write(pr.oconv(stdin=blacked_out_windows.encode(), octree=self.octree))
 
-    def generate_matrices(self):
+    def generate_matrices(self, view_matrices: bool = True):
+        """Generate all matrices required for the Five-Phase Method.
+
+        Args:
+            view_matrices: When False, skip the view-related matrices
+                (``view_window_matrices``, ``view_window_direct_matrices``,
+                ``view_sun_direct_matrices``,
+                ``view_sun_direct_illuminance_matrices``) and only build the
+                sensor and daylight matrices.  This matches the existing
+                ThreePhaseMethod.generate_matrices signature so callers like
+                ``EnergyPlusSetup.initialize_radiance`` (which is sensor-only
+                in EnergyPlus integration) can avoid the heavy view-matrix
+                rcontrib step.
+        """
         if self.mfile.exists():
             if not self.config.settings.overwrite:
                 self.load_matrices()
                 return
-        logger.info("Generating matrices...")
-        logger.info("Step 1/5: Generating view matrices...")
-        for mtx in self.view_window_matrices.values():
-            mtx.generate(
-                self.config.settings.view_window_matrix,
-                memmap=True,
-                nproc=self.config.settings.num_processors,
-            )
+        logger.info("Generating matrices (view_matrices=%s)...", view_matrices)
+        logger.info("Step 1/5: Generating window matrices...")
+        if view_matrices:
+            for mtx in self.view_window_matrices.values():
+                mtx.generate(
+                    self.config.settings.view_window_matrix,
+                    memmap=True,
+                    nproc=self.config.settings.num_processors,
+                )
         for mtx in self.sensor_window_matrices.values():
             mtx.generate(
                 self.config.settings.sensor_window_matrix,
@@ -1681,9 +1695,10 @@ class FivePhaseMethod(PhaseMethod):
                 self.config.settings.daylight_matrix,
                 nproc=self.config.settings.num_processors,
             )
-        logger.info("Step 3/5: Generating direct view matrices...")
-        for _, mtx in self.view_window_direct_matrices.items():
-            mtx.generate(["-ab", "1"], sparse=True)
+        logger.info("Step 3/5: Generating direct window matrices...")
+        if view_matrices:
+            for _, mtx in self.view_window_direct_matrices.items():
+                mtx.generate(["-ab", "1"], sparse=True)
         for _, mtx in self.sensor_window_direct_matrices.items():
             mtx.generate(["-ab", "1"], sparse=True)
         logger.info("Step 4/5: Generating direct daylight matrices...")
@@ -1692,10 +1707,11 @@ class FivePhaseMethod(PhaseMethod):
         logger.info("Step 5/5: Generating direct sun matrices...")
         for _, mtx in self.sensor_sun_direct_matrices.items():
             mtx.generate(["-ab", "0"])
-        for _, mtx in self.view_sun_direct_matrices.items():
-            mtx.generate(["-ab", "0"])
-        for _, mtx in self.view_sun_direct_illuminance_matrices.items():
-            mtx.generate(["-ab", "0", "-i+"])
+        if view_matrices:
+            for _, mtx in self.view_sun_direct_matrices.items():
+                mtx.generate(["-ab", "0"])
+            for _, mtx in self.view_sun_direct_illuminance_matrices.items():
+                mtx.generate(["-ab", "0", "-i+"])
         logger.info("Done!")
         if self.config.settings.save_matrices:
             self.save_matrices()
