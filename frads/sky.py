@@ -6,12 +6,75 @@ import datetime
 import logging
 import math
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import NamedTuple, Sequence
 
 import pyradiance as pr
 
 logger: logging.Logger = logging.getLogger("frads.sky")
+
+
+def gendaymtx_peak(
+    wea_bytes: bytes,
+    mfactor: int,
+    direct_only: bool = True,
+    onesun: bool = False,
+    sun_apex_deg: float = 0.533,
+) -> bytes:
+    """Run Radiance ``gendaymtx`` with McNeil's 5-phase ``-5`` flag.
+
+    The ``-5`` flag concentrates all direct solar energy of each timestep into
+    the single Reinhart sky patch nearest the sun, with the energy scaled to
+    suit the solar orb solid angle (parameter ``sun_apex_deg``). This is the
+    canonical pre-processor for the ``C_ds * S_sun`` term of the McNeil-2013
+    5-phase method. pyradiance does not currently expose this flag, so we shell
+    out to the system ``gendaymtx`` binary.
+
+    Args:
+        wea_bytes: WEA-formatted weather data (full file content including
+            header), bytes-encoded.
+        mfactor: Reinhart subdivision factor (1=145 patches, 6=5185 patches).
+        direct_only: Add ``-d`` to skip diffuse-sky contributions.
+        onesun: Add ``-O0`` for unit sun-radiance output.
+        sun_apex_deg: Sun apex angle in degrees (default 0.533, the visible
+            solar disk).
+
+    Returns:
+        Raw matrix bytes (``-o d`` double-precision binary format).
+
+    Raises:
+        FileNotFoundError: if ``gendaymtx`` is not on PATH.
+        subprocess.CalledProcessError: if ``gendaymtx`` fails.
+    """
+    if shutil.which("gendaymtx") is None:
+        raise FileNotFoundError(
+            "gendaymtx not found on PATH; install Radiance or extend PATH."
+        )
+    cmd: list[str] = [
+        "gendaymtx",
+        "-5", f"{sun_apex_deg}",
+        "-of",
+        "-h",
+        "-m", str(mfactor),
+    ]
+    if direct_only:
+        cmd.append("-d")
+    if onesun:
+        cmd.extend(["-O", "0"])
+    proc = subprocess.run(
+        cmd,
+        input=wea_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr
+        )
+    return proc.stdout
 
 
 class WeaMetaData(NamedTuple):

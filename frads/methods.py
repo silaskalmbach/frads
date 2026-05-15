@@ -27,8 +27,9 @@ from frads.matrix import (
     to_sparse_matrix3,
     sparse_matrix_multiply_rgb_vtds,
 )
-from frads.sky import parse_epw, parse_wea, WeaMetaData, WeaData, gen_perez_sky
+from frads.sky import parse_epw, parse_wea, WeaMetaData, WeaData, gen_perez_sky, gendaymtx_peak
 from frads.utils import random_string
+from frads._absdf_cache import cache_get as _absdf_cache_get
 import numpy as np
 import pyradiance as pr
 from pyradiance import parse_view
@@ -36,6 +37,142 @@ from scipy.sparse import csr_matrix
 
 
 logger = logging.getLogger("frads.methods")
+
+
+def _absdf_enabled() -> bool:
+    """True iff FRADS_USE_ABSDF=1 (Task-61 aBSDF + 5PM path active)."""
+    return os.environ.get("FRADS_USE_ABSDF") == "1"
+
+
+def _absdf_xml_dir() -> Path:
+    """Directory containing <state_name>_klems.xml files for aBSDF mode."""
+    raw = os.environ.get("FRADS_ABSDF_XML_DIR")
+    if not raw:
+        raise ValueError(
+            "FRADS_USE_ABSDF=1 requires FRADS_ABSDF_XML_DIR to point to "
+            "the directory containing <state>_klems.xml files."
+        )
+    p = Path(raw)
+    if not p.is_dir():
+        raise FileNotFoundError(f"FRADS_ABSDF_XML_DIR {p} is not a directory")
+    return p
+
+
+def _absdf_cache_dir() -> Path:
+    """Disk cache for per-pane Cds matrices."""
+    raw = os.environ.get(
+        "FRADS_ABSDF_CACHE_DIR",
+        str(Path.cwd() / "simulation" / "cache" / "cds"),
+    )
+    p = Path(raw)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _tt_enabled() -> bool:
+    """True iff FRADS_USE_TT_T=1 (tensor-tree T-matrix path active).
+
+    When enabled, the V*T*D multi-bounce path is evaluated via ``dctimestep``
+    against the tensor-tree BSDF XML (continuous Shirley-Chiu sampling)
+    instead of dense ``np.dot()`` with a Klems-145 T-matrix. Solves the
+    multi-bounce direct-sun patch quantization that drives the front-WPI
+    spike under Variante-B of the Task-61 high-resolution BSDF strategy.
+    """
+    return os.environ.get("FRADS_USE_TT_T") == "1"
+
+
+def _tt_xml_dir() -> Path:
+    """Directory containing <state_name>_tt.xml tensor-tree files."""
+    raw = os.environ.get("FRADS_TT_XML_DIR")
+    if not raw:
+        raise ValueError(
+            "FRADS_USE_TT_T=1 requires FRADS_TT_XML_DIR to point to "
+            "the directory containing <state>_tt.xml files."
+        )
+    p = Path(raw)
+    if not p.is_dir():
+        raise FileNotFoundError(f"FRADS_TT_XML_DIR {p} is not a directory")
+    return p
+
+
+def _tt_xml_for_state(state_key) -> Path:
+    """Resolve the tensor-tree XML path for a given state identifier.
+
+    state_key can be an int (e.g. 60) or a string ('60', 'state-60', etc).
+    Tries common naming patterns used in the FTG mockup pipeline.
+    """
+    raw = str(state_key)
+    digits = "".join(c for c in raw if c.isdigit()) or raw
+    xml_dir = _tt_xml_dir()
+    for name in (
+        f"TGU-eyriseS350_{digits}_tt.xml",
+        f"{digits}_tt.xml",
+        f"state-{digits}_tt.xml",
+        f"{raw}_tt.xml",
+    ):
+        candidate = xml_dir / name
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"No tensor-tree XML for state '{state_key}' found in {xml_dir}"
+    )
+
+
+def _tt_cache_dir() -> Path:
+    """Disk cache for combined V*T*D matrices baked via dctimestep."""
+    raw = os.environ.get(
+        "FRADS_TT_CACHE_DIR",
+        str(Path.cwd() / "simulation" / "cache" / "tt_vtd"),
+    )
+    p = Path(raw)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _gendaymtx_direct_sky(
+    wea_bytes: bytes, sky_mfactor: int, absdf_mode: bool,
+) -> np.ndarray:
+    """Build the per-timestep direct-only sky vector S_ds.
+
+    In aBSDF mode this uses McNeil's ``-5`` flag so the sun's energy lands in
+    a single Reinhart patch, matching the 5PM tutorial's
+    ``gendaymtx -m 1 -d -5 0.533`` recipe. Upstream Frads simply uses
+    ``sun_only=True`` without ``-5`` -- kept as the default branch for
+    backward compatibility.
+    """
+    if absdf_mode:
+        smx = gendaymtx_peak(
+            wea_bytes, mfactor=sky_mfactor, direct_only=True, onesun=False,
+        )
+    else:
+        smx = pr.gendaymtx(
+            wea_bytes, outform="d", mfactor=sky_mfactor,
+            header=False, sun_only=True,
+        )
+    nrows = BASIS_DIMENSION.get(f"r{sky_mfactor}", 145) + 1
+    return load_binary_matrix(smx, nrows=nrows, ncols=1, ncomp=3, dtype="d")
+
+
+def _gendaymtx_direct_sun(
+    wea_bytes: bytes, sun_mfactor: int, absdf_mode: bool,
+) -> np.ndarray:
+    """Build the per-timestep one-sun matrix S_sun (5185-patch for r6).
+
+    In aBSDF mode: uses ``-5`` flag plus ``onesun=True`` (``-O 0``) so each
+    Reinhart patch gets unit sun radiance scaled to the 0.533° solar disk
+    solid angle. This is McNeil's high-resolution sun-coefficient input.
+    """
+    if absdf_mode:
+        smx = gendaymtx_peak(
+            wea_bytes, mfactor=sun_mfactor, direct_only=True, onesun=True,
+        )
+    else:
+        smx = pr.gendaymtx(
+            wea_bytes, outform="d", mfactor=sun_mfactor,
+            header=False, sun_only=True, onesun=True,
+        )
+    nrows = BASIS_DIMENSION.get(f"r{sun_mfactor}", 5165) + 1
+    return load_binary_matrix(smx, nrows=nrows, ncols=1, ncomp=3, dtype="d")
 
 
 @dataclass(slots=True)
@@ -1462,6 +1599,10 @@ class FivePhaseMethod(PhaseMethod):
                 )
             )
         self.blacked_out_octree: Path = self.octdir / f"{random_string(5)}.oct"
+        # aBSDF mode (FRADS_USE_ABSDF=1): one octree per (pane_idx, state_key);
+        # default mode keeps the single blacked_out_octree above.
+        self.blacked_out_octrees: dict[tuple[int, str], Path] = {}
+        self._absdf = _absdf_enabled()
         self.vmap_oct: Path = self.octdir / f"vmap_{random_string(5)}.oct"
         self.cdmap_oct: Path = self.octdir / f"cdmap_{random_string(5)}.oct"
         self.window_senders: dict[str, SurfaceSender] = {}
@@ -1473,9 +1614,12 @@ class FivePhaseMethod(PhaseMethod):
         self.view_window_direct_matrices: dict[str, Matrix] = {}
         self.sensor_window_direct_matrices: dict[str, Matrix] = {}
         self.daylight_direct_matrices: dict[str, Matrix] = {}
-        self.sensor_sun_direct_matrices: dict[str, SunMatrix] = {}
-        self.view_sun_direct_matrices: dict[str, SunMatrix] = {}
-        self.view_sun_direct_illuminance_matrices: dict[str, SunMatrix] = {}
+        # Default mode: flat dict[sensor_name, SunMatrix];
+        # aBSDF mode: nested dict[sensor_name, dict[(pane_idx, state_key), SunMatrix]]
+        # The runtime aggregation in calculate_sensor/view chooses based on _absdf.
+        self.sensor_sun_direct_matrices: dict = {}
+        self.view_sun_direct_matrices: dict = {}
+        self.view_sun_direct_illuminance_matrices: dict = {}
         self.vmap: dict[str, np.ndarray] = {}
         self.cdmap: dict[str, np.ndarray] = {}
         self.direct_sun_matrix: np.ndarray = self.get_sky_matrix_from_wea(
@@ -1510,6 +1654,101 @@ class FivePhaseMethod(PhaseMethod):
                     + black_scene,
                 )
             )
+        if self._absdf:
+            self._gen_per_pane_state_octrees(
+                black_scene=black_scene,
+                black_bytes=black.bytes,
+                glow_bytes=glow.bytes,
+            )
+
+    def _gen_per_pane_state_octrees(
+        self,
+        *,
+        black_scene: bytes,
+        black_bytes: bytes,
+        glow_bytes: bytes,
+    ) -> None:
+        """Build one ``blacked_out_octree`` per (pane_idx, state_key) for the
+        Task-61-conformant aBSDF / Peak-Extraction path.
+
+        Each octree contains:
+
+        - all original materials and ``glow`` for sky sampling
+        - the target pane's window polygon **with an aBSDF modifier** pointing
+          at the per-state Klems XML (`<state>_klems.xml` in
+          ``FRADS_ABSDF_XML_DIR``)
+        - the other panes' window polygons forced to ``black`` modifier so
+          they absorb instead of transmitting (isolates the target pane's
+          direct-sun contribution; required for linear superposition over
+          spatially distinct panes)
+        - the rest of the scene blackened (no inter-reflections, matching
+          McNeil 2013 §3.2-§3.3)
+
+        ``self.blacked_out_octrees[(pane_idx, state_key)]`` holds the
+        resulting octree path. The set of state keys comes from
+        ``self.config.model.materials.matrices`` (BSDF construction names).
+        """
+        xml_dir = _absdf_xml_dir()
+        pane_names = list(self.config.model.windows.keys())
+        state_keys = sorted(self.config.model.materials.matrices.keys())
+        if not state_keys:
+            raise RuntimeError(
+                "FRADS_USE_ABSDF=1 but no Complex Fenestration State matrices "
+                "found in materials.matrices."
+            )
+        # Verify each state has an XML; otherwise raise early.
+        missing: list[str] = []
+        for sk in state_keys:
+            if not (xml_dir / f"{sk}_klems.xml").is_file():
+                missing.append(f"{sk}_klems.xml")
+        if missing:
+            raise FileNotFoundError(
+                "FRADS_USE_ABSDF=1 requires per-state Klems XMLs in "
+                f"{xml_dir}; missing: {missing}"
+            )
+
+        for pane_idx, pane_name in enumerate(pane_names):
+            window_bytes = self.config.model.windows[pane_name].bytes
+            # Other panes -> blackened polygons
+            other_black = b""
+            for j, other_name in enumerate(pane_names):
+                if j == pane_idx:
+                    continue
+                other_black += pr.Xform(
+                    self.config.model.windows[other_name].bytes,
+                    modifier="black",
+                )()
+            for state_key in state_keys:
+                xml_path = xml_dir / f"{state_key}_klems.xml"
+                mat_name = f"absdf_p{pane_idx}_{state_key}".replace("-", "_")
+                absdf_prim = pr.Primitive(
+                    "void",
+                    "aBSDF",
+                    mat_name,
+                    [str(xml_path), "0", "0", "1", "."],
+                    [],
+                )
+                # Window polygon under the aBSDF modifier
+                target_pane = pr.Xform(window_bytes, modifier=mat_name)()
+                octree_path = (
+                    self.octdir / f"absdf_p{pane_idx}_{state_key}_{random_string(4)}.oct"
+                )
+                with open(octree_path, "wb") as f:
+                    f.write(
+                        pr.oconv(
+                            *self.config.model.materials.files,
+                            stdin=(
+                                self.config.model.materials.bytes
+                                + glow_bytes
+                                + black_bytes
+                                + absdf_prim.bytes
+                                + target_pane
+                                + other_black
+                                + black_scene
+                            ),
+                        )
+                    )
+                self.blacked_out_octrees[(pane_idx, state_key)] = octree_path
 
     def _prepare_window_objects(self):
         for _name, window in self.config.model.windows.items():
@@ -1573,12 +1812,20 @@ class FivePhaseMethod(PhaseMethod):
                 list(self.window_receivers.values()),
                 self.blacked_out_octree,
             )
-            self.view_sun_direct_matrices[_v] = SunMatrix(
-                sender, self.view_sun_receiver, self.blacked_out_octree
-            )
-            self.view_sun_direct_illuminance_matrices[_v] = SunMatrix(
-                sender, self.view_sun_receiver, self.blacked_out_octree
-            )
+            if self._absdf:
+                self.view_sun_direct_matrices[_v] = self._build_per_pane_sunmatrix_dict(
+                    sender, self.view_sun_receiver,
+                )
+                self.view_sun_direct_illuminance_matrices[_v] = self._build_per_pane_sunmatrix_dict(
+                    sender, self.view_sun_receiver,
+                )
+            else:
+                self.view_sun_direct_matrices[_v] = SunMatrix(
+                    sender, self.view_sun_receiver, self.blacked_out_octree
+                )
+                self.view_sun_direct_illuminance_matrices[_v] = SunMatrix(
+                    sender, self.view_sun_receiver, self.blacked_out_octree
+                )
 
     def _prepare_sensor_sender_objects(self):
         for _s, sender in self.sensor_senders.items():
@@ -1590,9 +1837,26 @@ class FivePhaseMethod(PhaseMethod):
                 list(self.window_receivers.values()),
                 self.blacked_out_octree,
             )
-            self.sensor_sun_direct_matrices[_s] = SunMatrix(
-                sender, self.sensor_sun_receiver, self.blacked_out_octree
-            )
+            if self._absdf:
+                self.sensor_sun_direct_matrices[_s] = self._build_per_pane_sunmatrix_dict(
+                    sender, self.sensor_sun_receiver,
+                )
+            else:
+                self.sensor_sun_direct_matrices[_s] = SunMatrix(
+                    sender, self.sensor_sun_receiver, self.blacked_out_octree
+                )
+
+    def _build_per_pane_sunmatrix_dict(self, sender, sun_receiver):
+        """Build ``dict[(pane_idx, state_key), SunMatrix]`` for one sender.
+
+        Each entry uses the per-pane-state octree from
+        ``self.blacked_out_octrees`` so that ``rcontrib`` traces direct-sun
+        rays through one pane's aBSDF material while the other panes absorb.
+        """
+        out: dict[tuple[int, str], SunMatrix] = {}
+        for key, octree in self.blacked_out_octrees.items():
+            out[key] = SunMatrix(sender, sun_receiver, octree)
+        return out
 
     def _prepare_sun_receivers(self):
         if self.config.settings.sun_culling:
@@ -1705,16 +1969,84 @@ class FivePhaseMethod(PhaseMethod):
         for _, mtx in self.daylight_direct_matrices.items():
             mtx.generate(["-ab", "0"], sparse=True)
         logger.info("Step 5/5: Generating direct sun matrices...")
-        for _, mtx in self.sensor_sun_direct_matrices.items():
-            mtx.generate(["-ab", "0"])
-        if view_matrices:
-            for _, mtx in self.view_sun_direct_matrices.items():
+        if self._absdf:
+            self._generate_absdf_sun_matrices(view_matrices=view_matrices)
+        else:
+            for _, mtx in self.sensor_sun_direct_matrices.items():
                 mtx.generate(["-ab", "0"])
-            for _, mtx in self.view_sun_direct_illuminance_matrices.items():
-                mtx.generate(["-ab", "0", "-i+"])
+            if view_matrices:
+                for _, mtx in self.view_sun_direct_matrices.items():
+                    mtx.generate(["-ab", "0"])
+                for _, mtx in self.view_sun_direct_illuminance_matrices.items():
+                    mtx.generate(["-ab", "0", "-i+"])
         logger.info("Done!")
         if self.config.settings.save_matrices:
             self.save_matrices()
+
+    def _generate_absdf_sun_matrices(self, view_matrices: bool) -> None:
+        """Generate per-pane-state Cds matrices, caching each on disk.
+
+        For the aBSDF / Peak-Extraction path we trace through octrees that
+        contain the window aBSDF primitive. rcontrib needs at least one
+        ambient bounce (``-ab 1``) so the BSDF material can be sampled --
+        ``-ab 0`` would skip the BSDF entirely (see McNeil 2013 §4.1).
+        """
+        cache_dir = _absdf_cache_dir()
+        nproc = self.config.settings.num_processors
+
+        def _key_parts(
+            *, role: str, sender_name: str, pane_idx: int, state_key: str
+        ) -> list[bytes]:
+            xml_bytes = (
+                _absdf_xml_dir() / f"{state_key}_klems.xml"
+            ).read_bytes()
+            return [
+                b"absdf-v1",
+                role.encode(),
+                sender_name.encode(),
+                str(pane_idx).encode(),
+                state_key.encode(),
+                self.config.settings.sun_basis.encode(),
+                xml_bytes,
+            ]
+
+        def _generate_and_cache(
+            role: str, sender_name: str, mtx: SunMatrix, params: list[str],
+            pane_idx: int, state_key: str,
+        ) -> None:
+            def compute() -> np.ndarray:
+                mtx.generate(params, nproc=nproc, sparse=False)
+                return np.asarray(mtx.array)
+            arr = _absdf_cache_get(
+                _key_parts(
+                    role=role, sender_name=sender_name,
+                    pane_idx=pane_idx, state_key=state_key,
+                ),
+                compute,
+                cache_dir,
+            )
+            mtx.array = arr
+
+        for sensor_name, pane_dict in self.sensor_sun_direct_matrices.items():
+            for (pane_idx, state_key), mtx in pane_dict.items():
+                _generate_and_cache(
+                    "sensor_sun", sensor_name, mtx, ["-ab", "1"],
+                    pane_idx, state_key,
+                )
+
+        if view_matrices:
+            for view_name, pane_dict in self.view_sun_direct_matrices.items():
+                for (pane_idx, state_key), mtx in pane_dict.items():
+                    _generate_and_cache(
+                        "view_sun", view_name, mtx, ["-ab", "1"],
+                        pane_idx, state_key,
+                    )
+            for view_name, pane_dict in self.view_sun_direct_illuminance_matrices.items():
+                for (pane_idx, state_key), mtx in pane_dict.items():
+                    _generate_and_cache(
+                        "view_sun_ill", view_name, mtx, ["-ab", "1", "-i+"],
+                        pane_idx, state_key,
+                    )
 
     def load_matrices(self):
         """ """
@@ -1732,12 +2064,17 @@ class FivePhaseMethod(PhaseMethod):
             mtx.array = mdata[f"{sensor}_window_direct_matrix"]
         for window, mtx in self.daylight_direct_matrices.items():
             mtx.array = mdata[f"{window}_daylight_direct_matrix"]
-        for sensor, mtx in self.sensor_sun_direct_matrices.items():
-            mtx.array = mdata[f"{sensor}_sun_direct_matrix"]
-        for view, mtx in self.view_sun_direct_matrices.items():
-            mtx.array = mdata[f"{view}_sun_direct_matrix"]
-        for view, mtx in self.view_sun_direct_illuminance_matrices.items():
-            mtx.array = mdata[f"{view}_sun_direct_illuminance_matrix"]
+        if self._absdf:
+            # aBSDF sun matrices live in their own disk cache (per pane*state);
+            # the bulk .npz only carries the diffuse + window matrices above.
+            self._generate_absdf_sun_matrices(view_matrices=bool(self.view_sun_direct_matrices))
+        else:
+            for sensor, mtx in self.sensor_sun_direct_matrices.items():
+                mtx.array = mdata[f"{sensor}_sun_direct_matrix"]
+            for view, mtx in self.view_sun_direct_matrices.items():
+                mtx.array = mdata[f"{view}_sun_direct_matrix"]
+            for view, mtx in self.view_sun_direct_illuminance_matrices.items():
+                mtx.array = mdata[f"{view}_sun_direct_illuminance_matrix"]
 
     def calculate_view(
         self,
@@ -1779,20 +2116,14 @@ class FivePhaseMethod(PhaseMethod):
         sky_matrix = self.get_sky_matrix(time, dni, dhi)
         _wea_str = self.wea_header + str(WeaData(time, dni, dhi))
 
-        smx_d = pr.gendaymtx(
-            _wea_str.encode(), outform="d", mfactor=sky_mfactor,
-            header=False, sun_only=True,
+        direct_sky = _gendaymtx_direct_sky(
+            _wea_str.encode(), sky_mfactor, self._absdf,
         )
-        nrows_d = BASIS_DIMENSION.get(f"r{sky_mfactor}", 145) + 1
-        direct_sky = load_binary_matrix(smx_d, nrows=nrows_d, ncols=1, ncomp=3, dtype="d")
         direct_sky_sparse = to_sparse_matrix3(direct_sky)
 
-        smx_s = pr.gendaymtx(
-            _wea_str.encode(), outform="d", mfactor=sun_mfactor,
-            header=False, sun_only=True, onesun=True,
+        direct_sun = _gendaymtx_direct_sun(
+            _wea_str.encode(), sun_mfactor, self._absdf,
         )
-        nrows_s = BASIS_DIMENSION.get(f"r{sun_mfactor}", 5165) + 1
-        direct_sun = load_binary_matrix(smx_s, nrows=nrows_s, ncols=1, ncomp=3, dtype="d")
         direct_sun_sparse = to_sparse_matrix3(direct_sun)
 
         npix = self.view_window_matrices[view].nrows
@@ -1824,20 +2155,36 @@ class FivePhaseMethod(PhaseMethod):
 
                 diag_diffuse[:, :, c] += vtdsmx - vtdsmx_d
 
-        for c in range(3):
-            cdr = self.view_sun_direct_matrices[view].array[c].dot(
-                direct_sun_sparse[c][:, :1]
-            )
-            cdf_raw = self.view_sun_direct_illuminance_matrices[view].array[c].dot(
-                direct_sun_sparse[c][:, :1]
-            )
-            cdf = cdf_raw.multiply(csr_matrix(self.cdmap[view][:, :, c]))
+        if self._absdf:
+            cdr_pane_dict = self.view_sun_direct_matrices[view]
+            cdf_pane_dict = self.view_sun_direct_illuminance_matrices[view]
+            for pane_idx, _name in enumerate(self.config.model.windows):
+                state_key = bsdf[pane_idx] if isinstance(bsdf, list) else bsdf[_name]
+                cdr_mtx = cdr_pane_dict[(pane_idx, state_key)]
+                cdf_mtx = cdf_pane_dict[(pane_idx, state_key)]
+                for c in range(3):
+                    cdr = cdr_mtx.array[c].dot(direct_sun_sparse[c][:, :1])
+                    cdf_raw = cdf_mtx.array[c].dot(direct_sun_sparse[c][:, :1])
+                    cdf = cdf_raw.multiply(csr_matrix(self.cdmap[view][:, :, c]))
+                    cdr_d = cdr.toarray() if hasattr(cdr, "toarray") else cdr
+                    cdf_d = cdf.toarray() if hasattr(cdf, "toarray") else cdf
+                    diag_cdr[:, :, c] += cdr_d
+                    diag_cdf[:, :, c] += cdf_d
+        else:
+            for c in range(3):
+                cdr = self.view_sun_direct_matrices[view].array[c].dot(
+                    direct_sun_sparse[c][:, :1]
+                )
+                cdf_raw = self.view_sun_direct_illuminance_matrices[view].array[c].dot(
+                    direct_sun_sparse[c][:, :1]
+                )
+                cdf = cdf_raw.multiply(csr_matrix(self.cdmap[view][:, :, c]))
 
-            cdr_d = cdr.toarray() if hasattr(cdr, "toarray") else cdr
-            cdf_d = cdf.toarray() if hasattr(cdf, "toarray") else cdf
+                cdr_d = cdr.toarray() if hasattr(cdr, "toarray") else cdr
+                cdf_d = cdf.toarray() if hasattr(cdf, "toarray") else cdf
 
-            diag_cdr[:, :, c] = cdr_d
-            diag_cdf[:, :, c] = cdf_d
+                diag_cdr[:, :, c] = cdr_d
+                diag_cdf[:, :, c] = cdf_d
 
         return (sky_scale * diag_diffuse
                 + sun_scale * diag_cdr
@@ -1884,23 +2231,13 @@ class FivePhaseMethod(PhaseMethod):
         sky_matrix = self.get_sky_matrix(time, dni, dhi)
         _wea_str = self.wea_header + str(WeaData(time, dni, dhi))
 
-        smx_d = pr.gendaymtx(
-            _wea_str.encode(), outform="d", mfactor=sky_mfactor,
-            header=False, sun_only=True,
-        )
-        nrows_d = BASIS_DIMENSION.get(f"r{sky_mfactor}", 145) + 1
-        direct_sky_matrix = load_binary_matrix(
-            smx_d, nrows=nrows_d, ncols=1, ncomp=3, dtype="d"
+        direct_sky_matrix = _gendaymtx_direct_sky(
+            _wea_str.encode(), sky_mfactor, self._absdf,
         )
         direct_sky_matrix_sparse = to_sparse_matrix3(direct_sky_matrix)
 
-        smx_s = pr.gendaymtx(
-            _wea_str.encode(), outform="d", mfactor=sun_mfactor,
-            header=False, sun_only=True, onesun=True,
-        )
-        nrows_s = BASIS_DIMENSION.get(f"r{sun_mfactor}", 5165) + 1
-        direct_sun_sky = load_binary_matrix(
-            smx_s, nrows=nrows_s, ncols=1, ncomp=3, dtype="d"
+        direct_sun_sky = _gendaymtx_direct_sun(
+            _wea_str.encode(), sun_mfactor, self._absdf,
         )
         direct_sun_sky_sparse = to_sparse_matrix3(direct_sun_sky)
 
@@ -1935,15 +2272,27 @@ class FivePhaseMethod(PhaseMethod):
                 _res_d += w * vtds
             res3d += _res_d
 
-        # rescd: direct sun component via high-res sun coefficients
+        # rescd: direct sun component via high-res sun coefficients.
+        # aBSDF path: sum over panes, each with its current state's Cds matrix.
         rescd = np.zeros((self.sensor_senders[sensor].yres, 1))
-        for c, w in enumerate(weights):
-            cds = self.sensor_sun_direct_matrices[sensor].array[c].dot(
-                direct_sun_sky_sparse[c][:, :1]
-            )
-            if hasattr(cds, "toarray"):
-                cds = cds.toarray()
-            rescd += w * cds
+        if self._absdf:
+            pane_dict = self.sensor_sun_direct_matrices[sensor]
+            for pane_idx, _name in enumerate(self.config.model.windows):
+                state_key = bsdf[pane_idx] if isinstance(bsdf, list) else bsdf[_name]
+                mtx = pane_dict[(pane_idx, state_key)]
+                for c, w in enumerate(weights):
+                    cds = mtx.array[c].dot(direct_sun_sky_sparse[c][:, :1])
+                    if hasattr(cds, "toarray"):
+                        cds = cds.toarray()
+                    rescd += w * cds
+        else:
+            for c, w in enumerate(weights):
+                cds = self.sensor_sun_direct_matrices[sensor].array[c].dot(
+                    direct_sun_sky_sparse[c][:, :1]
+                )
+                if hasattr(cds, "toarray"):
+                    cds = cds.toarray()
+                rescd += w * cds
 
         result = sky_scale * (res3 - res3d) + sun_scale * rescd
         return result.flatten()
@@ -2057,12 +2406,16 @@ class FivePhaseMethod(PhaseMethod):
             matrices[f"{sensor}_window_direct_matrix"] = mtx.array
         for window, mtx in self.daylight_direct_matrices.items():
             matrices[f"{window}_daylight_direct_matrix"] = mtx.array
-        for sensor, mtx in self.sensor_sun_direct_matrices.items():
-            matrices[f"{sensor}_sun_direct_matrix"] = mtx.array
-        for view, mtx in self.view_sun_direct_matrices.items():
-            matrices[f"{view}_sun_direct_matrix"] = mtx.array
-        for view, mtx in self.view_sun_direct_illuminance_matrices.items():
-            matrices[f"{view}_sun_direct_illuminance_matrix"] = mtx.array
+        if not self._absdf:
+            # aBSDF sun matrices are persisted via the per-pane disk cache
+            # (see _generate_absdf_sun_matrices); keep them out of the bulk
+            # .npz so the file stays comparable to upstream Frads.
+            for sensor, mtx in self.sensor_sun_direct_matrices.items():
+                matrices[f"{sensor}_sun_direct_matrix"] = mtx.array
+            for view, mtx in self.view_sun_direct_matrices.items():
+                matrices[f"{view}_sun_direct_matrix"] = mtx.array
+            for view, mtx in self.view_sun_direct_illuminance_matrices.items():
+                matrices[f"{view}_sun_direct_illuminance_matrix"] = mtx.array
         np.savez_compressed(self.mfile, **matrices)
 
 

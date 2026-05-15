@@ -770,6 +770,55 @@ def load_matrix(file: bytes | str | Path, dtype: str = "float") -> np.ndarray:
     )
 
 
+def write_radiance_binary(
+    array: np.ndarray,
+    path: str | Path,
+    dtype: str = "d",
+    extra_metadata: dict[str, str] | None = None,
+) -> None:
+    """Write a Radiance-format binary matrix file consumable by ``dctimestep``.
+
+    Args:
+        array: Numpy array shape (nrows, ncols, ncomp) holding RGB matrix data.
+        path: Output file path.
+        dtype: 'd' for double (float64), 'f' for float (float32).
+        extra_metadata: Optional dict of header metadata lines to embed.
+
+    The header follows the Radiance ASCII-header / binary-payload convention:
+        #?RADIANCE
+        <metadata lines>
+        NROWS=<n>
+        NCOLS=<m>
+        NCOMP=<c>
+        FORMAT=<double|float>
+        <blank line>
+        <binary little-endian payload, row-major, RGB-interleaved per element>
+    """
+    if array.ndim != 3:
+        raise ValueError(
+            f"write_radiance_binary expects 3D (nrows, ncols, ncomp) array; "
+            f"got shape {array.shape}"
+        )
+    nrows, ncols, ncomp = array.shape
+    fmt = "double" if dtype.startswith("d") else "float"
+    np_dtype = np.float64 if dtype.startswith("d") else np.float32
+    header_lines = ["#?RADIANCE", "frads.matrix.write_radiance_binary"]
+    if extra_metadata:
+        header_lines.extend(f"{k}={v}" for k, v in extra_metadata.items())
+    header_lines.extend([
+        f"NROWS={nrows}",
+        f"NCOLS={ncols}",
+        f"NCOMP={ncomp}",
+        "BigEndian=0",
+        f"FORMAT={fmt}",
+        "",
+    ])
+    header = "\n".join(header_lines) + "\n"
+    with open(path, "wb") as f:
+        f.write(header.encode("ascii"))
+        f.write(np.ascontiguousarray(array, dtype=np_dtype).tobytes())
+
+
 def load_binary_matrix(
     buffer: bytes, nrows: int, ncols: int, ncomp: int, dtype: str, header: bool = False
 ) -> np.ndarray:
