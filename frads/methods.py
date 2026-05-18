@@ -134,21 +134,19 @@ def _gendaymtx_direct_sky(
 ) -> np.ndarray:
     """Build the per-timestep direct-only sky vector S_ds.
 
-    In aBSDF mode this uses McNeil's ``-5`` flag so the sun's energy lands in
-    a single Reinhart patch, matching the 5PM tutorial's
-    ``gendaymtx -m 1 -d -5 0.533`` recipe. Upstream Frads simply uses
-    ``sun_only=True`` without ``-5`` -- kept as the default branch for
-    backward compatibility.
+    NOTE: This vector is consumed as ``S_ds`` in ``V_d*T*D_d*S_ds`` which is
+    subtracted from ``V*T*D*S`` (where ``S`` comes from the regular
+    ``get_sky_matrix`` using ``pr.gendaymtx`` without ``-5``).  S_ds must use
+    the SAME sun-distribution as S, otherwise the subtraction produces
+    negative WPI values.  In an earlier aBSDF-patch revision we used the
+    ``-5`` flag here, which broke this invariant -- it has been removed.
+    The ``-5``/``-O0`` peak-extraction sky is only used downstream in
+    ``_gendaymtx_direct_sun`` for the high-resolution ``Ssun`` vector.
     """
-    if absdf_mode:
-        smx = gendaymtx_peak(
-            wea_bytes, mfactor=sky_mfactor, direct_only=True, onesun=False,
-        )
-    else:
-        smx = pr.gendaymtx(
-            wea_bytes, outform="d", mfactor=sky_mfactor,
-            header=False, sun_only=True,
-        )
+    smx = pr.gendaymtx(
+        wea_bytes, outform="d", mfactor=sky_mfactor,
+        header=False, sun_only=True,
+    )
     nrows = BASIS_DIMENSION.get(f"r{sky_mfactor}", 145) + 1
     return load_binary_matrix(smx, nrows=nrows, ncols=1, ncomp=3, dtype="d")
 
@@ -1301,6 +1299,8 @@ class ThreePhaseMethod(PhaseMethod):
         Returns:
             A float value of illuminance
         """
+        # DEBUG: marker for ThreePhase calculate_sensor (with caller type)
+        print(f"[THREEPHASE_CALC_SENSOR_ENTRY] sensor={sensor} time={time} self_type={type(self).__name__}", flush=True)
         sky_matrix = self.get_sky_matrix(time, dni, dhi)
         res = []
         if isinstance(bsdf, list):
@@ -2223,6 +2223,8 @@ class FivePhaseMethod(PhaseMethod):
         Returns:
             ndarray of illuminance values [lux] for the sensor points.
         """
+        # DEBUG: visible marker at function entry
+        print(f"[FIVEPHASE_CALC_SENSOR_ENTRY] sensor={sensor} time={time}", flush=True)
         weights = [47.4, 119.9, 11.6]
 
         sky_mfactor = int(self.config.settings.sky_basis[-1])
@@ -2295,6 +2297,29 @@ class FivePhaseMethod(PhaseMethod):
                 rescd += w * cds
 
         result = sky_scale * (res3 - res3d) + sun_scale * rescd
+
+        # DEBUG: visible marker that this code path runs
+        print(f"[CALC_SENSOR_5PM] sensor={sensor} time={time} env_breakdown={os.environ.get('FRADS_DEBUG_SENSOR_BREAKDOWN', 'NONE')}", flush=True)
+        # Optional sensor-component breakdown for 5PM validation tests.
+        # Enabled by FRADS_DEBUG_SENSOR_BREAKDOWN=<csv-path>. One line appended per
+        # call: time,sensor,res3,res3d,rescd,result,sky_scale,sun_scale,dni,dhi
+        _breakdown_csv = os.environ.get("FRADS_DEBUG_SENSOR_BREAKDOWN")
+        if _breakdown_csv:
+            try:
+                t_str = time.strftime("%Y-%m-%d %H:%M:%S") if hasattr(time, "strftime") else str(time)
+                line = (
+                    f"{t_str},{sensor},"
+                    f"{float(res3.sum()):.4f},"
+                    f"{float(res3d.sum()):.4f},"
+                    f"{float(rescd.sum()):.4f},"
+                    f"{float(result.sum()):.4f},"
+                    f"{sky_scale},{sun_scale},{dni},{dhi}\n"
+                )
+                with open(_breakdown_csv, "a") as _f:
+                    _f.write(line)
+            except Exception:
+                pass
+
         return result.flatten()
 
     def calculate_view_from_wea(self, view: str):

@@ -55,14 +55,15 @@ def gendaymtx_peak(
     cmd: list[str] = [
         "gendaymtx",
         "-5", f"{sun_apex_deg}",
-        "-of",
+        "-od",
         "-h",
         "-m", str(mfactor),
     ]
     if direct_only:
         cmd.append("-d")
     if onesun:
-        cmd.extend(["-O", "0"])
+        # gendaymtx requires -O0 as a single argument (not "-O 0").
+        cmd.append("-O0")
     proc = subprocess.run(
         cmd,
         input=wea_bytes,
