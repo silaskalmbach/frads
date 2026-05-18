@@ -77,7 +77,7 @@ def cache_get(
     lock_path = cache_dir / f"{key}.lock"
 
     if npz_path.exists():
-        data = np.load(npz_path, allow_pickle=False)
+        data = np.load(npz_path, allow_pickle=True)
         keys = list(data.files)
         if keys == ["arr"]:
             return data["arr"]
@@ -85,7 +85,7 @@ def cache_get(
 
     with FileLock(str(lock_path)):
         if npz_path.exists():  # filled by another process while we waited
-            data = np.load(npz_path, allow_pickle=False)
+            data = np.load(npz_path, allow_pickle=True)
             keys = list(data.files)
             if keys == ["arr"]:
                 return data["arr"]
