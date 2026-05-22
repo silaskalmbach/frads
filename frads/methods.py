@@ -129,6 +129,83 @@ def _tt_cache_dir() -> Path:
     return p
 
 
+def _rgb_to_rgbe(rgb: np.ndarray) -> np.ndarray:
+    """Encode (H, W, 3) float RGB as (H, W, 4) uint8 RGBE for Radiance HDR.
+
+    Mirrors the encoder originally written for
+    ``01_FRADS/rl/evaluation/render_dgp_5pm.py``. We carry it inside
+    frads-fork because pyradiance's ``pvalue -r -df`` pipeline silently
+    emits zero pixels on this build, which kills any in-process 5PM
+    image -> HDR -> evalglare round trip.
+    """
+    H, W, _ = rgb.shape
+    m = rgb.max(axis=2)
+    rgbe = np.zeros((H, W, 4), dtype=np.uint8)
+    valid = m > 1e-32
+    mant, exp = np.frexp(m[valid])
+    scale = 256.0 * mant / m[valid]
+    rgbe[valid, 0] = np.clip(rgb[valid, 0] * scale, 0, 255).astype(np.uint8)
+    rgbe[valid, 1] = np.clip(rgb[valid, 1] * scale, 0, 255).astype(np.uint8)
+    rgbe[valid, 2] = np.clip(rgb[valid, 2] * scale, 0, 255).astype(np.uint8)
+    rgbe[valid, 3] = (exp + 128).astype(np.uint8)
+    return rgbe
+
+
+def _write_radiance_hdr(
+    rgb: np.ndarray, path: "str | Path", extra_header: bytes = b""
+) -> None:
+    """Write a (H, W, 3) float RGB array as a Radiance .hdr file."""
+    H, W, _ = rgb.shape
+    rgbe = _rgb_to_rgbe(rgb.astype(np.float32))
+    with open(path, "wb") as f:
+        f.write(b"#?RADIANCE\n")
+        f.write(b"FORMAT=32-bit_rle_rgbe\n")
+        if extra_header:
+            f.write(extra_header)
+        f.write(b"\n")
+        f.write(f"-Y {H} +X {W}\n".encode())
+        f.write(rgbe.tobytes())
+
+
+def _parse_evalglare_dgp(out: "bytes | str") -> float:
+    """Parse evalglare's stdout to extract the DGP value.
+
+    evalglare's default summary format is a single line with a CSV
+    header followed by colon-separated values, e.g.::
+
+        dgp,dgi,ugr,vcp,cgi,Lveil: 0.159000 0.000000 0.000000 100.000000 0.000000 0.000000
+
+    Some invocations also emit progress/diagnostic lines before that.
+    Strategy: locate the first colon-bearing summary line (header lists
+    the requested glare metrics in order, DGP first), then take the
+    first floating-point token after the colon. Falls back to scanning
+    all whitespace tokens line-by-line for a parseable float -- which
+    still finds the DGP because it is the first numeric value emitted.
+    """
+    text = out.decode() if isinstance(out, bytes) else out
+
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        head, _, tail = line.partition(":")
+        if "dgp" not in head.lower():
+            continue
+        for tok in tail.split():
+            try:
+                return float(tok)
+            except ValueError:
+                continue
+
+    for line in text.splitlines():
+        for tok in line.strip().split():
+            try:
+                return float(tok)
+            except ValueError:
+                continue
+
+    raise RuntimeError(f"evalglare produced no parseable DGP. stdout: {text!r}")
+
+
 def _gendaymtx_direct_sky(
     wea_bytes: bytes, sky_mfactor: int, absdf_mode: bool,
 ) -> np.ndarray:
@@ -2416,6 +2493,108 @@ class FivePhaseMethod(PhaseMethod):
                 self.direct_sun_matrix[c],
             )
         return res3 - res3d + rescd
+
+    def calculate_dgp(
+        self,
+        view: str,
+        bsdf: dict[str, str],
+        time: datetime,
+        dni: float,
+        dhi: float,
+        ev_sensor: str | None = None,
+        save_hdr: None | str | Path = None,
+    ) -> tuple[float, float]:
+        """Daylight Glare Probability via 5PM matrix-image + evalglare.
+
+        Canonical scientific path for BSDF-modeled glare evaluation:
+
+          1. Render fisheye HDR from V*T*D*S - Vd*T*Dd*Sd + Cds*Ssun + Cdf*Ssun
+             (McNeil 2013 IEA SHC Task 50; aBSDF peak-extraction Task 61).
+          2. Compute Ev via the 5PM sensor matrix at a co-located sensor.
+          3. Hand the HDR + external Ev to evalglare (Wienold 2006).
+
+        This replaces the rpict-based calculate_edgps (Wienold 2009
+        eDGPs) when the workflow is FivePhaseMethod: rpict cannot
+        resolve Klems-BSDF transmission per patch and renders facade
+        glass as opaque polygons -- yielding the saturated DGP plateau
+        observed for FTG (max 0.018 vs real ~0.29). The 5PM-image path
+        uses the SAME calibrated matrices as the sensor pipeline, so
+        the DGP and WPI metrics share one numerical model.
+
+        Requires the view matrices (V, Vd, Cds, Cdf) to be populated.
+        ``EnergyPlusSetup.initialize_radiance`` calls
+        ``generate_matrices(view_matrices=False)`` by default; pass
+        ``view_matrices=True`` (the override added in this commit) when
+        a calculate_dgp consumer is configured.
+
+        Args:
+            view: View name (key into ``self.view_window_matrices``).
+            bsdf: dict ``{window_name: matrix_key}`` for current CFS state.
+            time, dni, dhi: per-step weather.
+            ev_sensor: Sensor name in ``self.sensor_window_matrices``
+                co-located with the view. Used for evalglare's external
+                Ev calibration. If missing or absent from the matrices,
+                evalglare derives Ev from the HDR.
+            save_hdr: Optional path to keep the rendered HDR (debug).
+
+        Returns:
+            Tuple ``(dgp, ev)``. ``ev`` is the 5PM-sensor Ev in lux
+            when ``ev_sensor`` resolves, else 0.0.
+        """
+        if view not in self.view_window_matrices:
+            raise RuntimeError(
+                f"calculate_dgp: view '{view}' has no view_window_matrices. "
+                "Call initialize_radiance with view_matrices=True (or run "
+                "generate_matrices(view_matrices=True) once) before using "
+                "this method."
+            )
+        if self.view_window_matrices[view].array is None:
+            raise RuntimeError(
+                f"calculate_dgp: view '{view}' has an unpopulated "
+                "view_window_matrices entry (Matrix.array is None). "
+                "initialize_radiance was called with view_matrices=False; "
+                "rerun with view_matrices=True."
+            )
+
+        # 1. 5PM image
+        img = self.calculate_view(view, bsdf, time, dni, dhi)
+        vs = self.view_senders[view]
+        yres, xres = vs.yres, vs.xres
+        rgb = img.reshape(yres, xres, 3).astype(np.float32)
+
+        # 2. Optional Ev from co-located sensor
+        ev_value = 0.0
+        if ev_sensor is not None and ev_sensor in self.sensor_window_matrices:
+            ev_array = self.calculate_sensor(ev_sensor, bsdf, time, dni, dhi)
+            ev_value = float(
+                ev_array.item() if ev_array.size == 1 else ev_array.mean()
+            )
+
+        # 3. Write HDR to disk (evalglare needs a file path for view header)
+        hdr_path = self.octdir / f"dgp_{random_string(5)}.hdr"
+        view_args = pr.get_view_args(vs.view)
+        view_header = b"VIEW= " + " ".join(view_args).encode() + b"\n"
+        _write_radiance_hdr(rgb, hdr_path, extra_header=view_header)
+        if save_hdr is not None:
+            from shutil import copyfile
+            copyfile(hdr_path, save_hdr)
+
+        # 4. evalglare with external Ev when available
+        try:
+            if ev_value > 0:
+                out = pr.evalglare(
+                    str(hdr_path), correction_mode="l-", ev=ev_value
+                )
+            else:
+                out = pr.evalglare(str(hdr_path), correction_mode="l-")
+            dgp = _parse_evalglare_dgp(out)
+        finally:
+            try:
+                os.remove(hdr_path)
+            except OSError:
+                pass
+
+        return dgp, ev_value
 
     def calculate_edgps(
         self,

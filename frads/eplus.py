@@ -145,19 +145,32 @@ class EnergyPlusSetup:
         self.actuators = []
         self._get_list_of_actuators()
 
-    def initialize_radiance(self, zones: None | list[str] = None, nproc: int = 1):
+    def initialize_radiance(
+        self,
+        zones: None | list[str] = None,
+        nproc: int = 1,
+        view_matrices: bool = False,
+    ):
         """Initialize Radiance for Three-Phase Method.
 
         Args:
             zones: List of zones to initialize. If None, initialize all zones.
             nproc: Number of processors to use for generating matrices.
+            view_matrices: Forwarded to ``generate_matrices``. Default
+                False keeps the cheap sensor-only init that suffices for
+                ``calculate_sensor`` (WPI/Ev). Set True when downstream
+                code needs the V*T*D*S image matrices (e.g.
+                ``FivePhaseMethod.calculate_dgp`` for 5PM-image-based
+                glare evaluation). The view-matrix step is heavy
+                (~minutes for 800x800) but persists to the .npz mfile
+                so subsequent runs hit the cache.
         """
         if zones is None:
             zones = list(self.rworkflows.keys())
         for zone in zones:
             self.rworkflows[zone].config.settings.save_matrices = True
             self.rworkflows[zone].config.settings.num_processors = nproc
-            self.rworkflows[zone].generate_matrices(view_matrices=False)
+            self.rworkflows[zone].generate_matrices(view_matrices=view_matrices)
 
     def close(self):
         self.api.state_manager.delete_state(self.state)
@@ -819,6 +832,48 @@ class EnergyPlusSetup:
         view_name = next(iter(self.rconfigs[zone].model.views.keys()))
         return self.rworkflows[zone].calculate_edgps(
             view_name, cfs_name, date_time, dni, dhi
+        )
+
+    def calculate_dgp(
+        self,
+        zone: str,
+        cfs_name: dict[str, str],
+        ev_sensor: str | None = None,
+        save_hdr: "None | str | Path" = None,
+    ) -> tuple[float, float]:
+        """5PM-image-based Daylight Glare Probability.
+
+        Routes to ``FivePhaseMethod.calculate_dgp`` (McNeil 2013 image
+        formula + evalglare), which is the scientifically rigorous
+        match to a Pi-Cam DGP measurement pipeline.
+
+        Args:
+            zone: Zone name (key into ``self.rworkflows``).
+            cfs_name: dict ``{window_name: matrix_key}`` for the
+                current shading state.
+            ev_sensor: Sensor name co-located with the eDGP view, used
+                for evalglare's external Ev calibration.
+            save_hdr: Optional path to keep the per-step HDR (debug).
+        """
+        date_time = self.get_datetime()
+        dni = self.get_direct_normal_irradiance()
+        dhi = self.get_diffuse_horizontal_irradiance()
+        view_name = next(iter(self.rconfigs[zone].model.views.keys()))
+        workflow = self.rworkflows[zone]
+        if not hasattr(workflow, "calculate_dgp"):
+            raise RuntimeError(
+                f"calculate_dgp requires a workflow with the method; "
+                f"{type(workflow).__name__} has none. Use a FivePhaseMethod "
+                "workflow (radiance_method='5phase')."
+            )
+        return workflow.calculate_dgp(
+            view_name,
+            cfs_name,
+            date_time,
+            dni,
+            dhi,
+            ev_sensor=ev_sensor,
+            save_hdr=save_hdr,
         )
 
     def add_proxy_geometry(self, gs: GlazingSystem):
