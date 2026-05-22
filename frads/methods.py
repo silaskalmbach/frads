@@ -2417,6 +2417,77 @@ class FivePhaseMethod(PhaseMethod):
             )
         return res3 - res3d + rescd
 
+    def calculate_edgps(
+        self,
+        view: str,
+        bsdf: dict[str, str],
+        time: datetime,
+        dni: float,
+        dhi: float,
+        ambient_bounce: int = 0,
+        save_hdr: None | str | Path = None,
+        ev_sensor: str | None = None,
+    ) -> tuple[float, float]:
+        """Five-Phase Method eDGP: rpict fisheye + evalglare.
+
+        Mirrors :meth:`ThreePhaseMethod.calculate_edgps` but adapts to the
+        5PM architecture where views and sensors are tracked separately.
+        Without this override, FivePhaseMethod inherits no eDGP method
+        (the 3PM one lives on ``ThreePhaseMethod``, not ``PhaseMethod``),
+        so EnergyPlus callbacks calling ``calculate_edgps`` raise
+        ``AttributeError`` silently inside pyenergyplus' ctypes layer and
+        deadlock the frads-gym main thread waiting on ``obs_data_queue``.
+
+        The vertical eye-illuminance (Ev) used by evalglare for
+        calibration is computed from a co-located sensor when
+        ``ev_sensor`` names a key of ``self.sensor_window_matrices``.
+        Otherwise evalglare derives Ev from the HDR — acceptable for
+        unblocking the pipeline; pass ``ev_sensor`` for proper 5PM Ev.
+        """
+        stdins = [
+            gen_perez_sky(
+                time,
+                self.wea_metadata.latitude,
+                self.wea_metadata.longitude,
+                self.wea_metadata.timezone,
+                dirnorm=dni,
+                diffhor=dhi,
+            )
+        ]
+        for wname, sname in bsdf.items():
+            if (_pgs := self.config.model.windows[wname].proxy_geometry) != {}:
+                stdins.append(_pgs[sname])
+
+        octree = self.octdir / f"edgps_{random_string(5)}.oct"
+        with open(octree, "wb") as f:
+            f.write(pr.oconv(stdin=b"".join(stdins), octree=self.octree))
+
+        hdr = pr.rpict(
+            pr.get_view_args(self.view_senders[view].view),
+            octree,
+            xres=800,
+            yres=800,
+            params=["-ab", str(ambient_bounce)],
+        )
+        if save_hdr is not None:
+            with open(save_hdr, "wb") as f:
+                f.write(hdr)
+
+        ev_value = 0.0
+        if ev_sensor is not None and ev_sensor in self.sensor_window_matrices:
+            ev_array = self.calculate_sensor(ev_sensor, bsdf, time, dni, dhi)
+            ev_value = float(
+                ev_array.item() if ev_array.size == 1 else ev_array.mean()
+            )
+
+        if ev_value > 0:
+            res = pr.evalglare(hdr, fast=1, correction_mode="l-", ev=ev_value)
+        else:
+            res = pr.evalglare(hdr, fast=1, correction_mode="l-")
+        edgps = float(res)
+        os.remove(octree)
+        return edgps, ev_value
+
     def save_matrices(self):
         matrices = {}
         for view, mtx in self.view_window_matrices.items():
