@@ -2015,7 +2015,40 @@ class FivePhaseMethod(PhaseMethod):
         if self.mfile.exists():
             if not self.config.settings.overwrite:
                 self.load_matrices()
-                return
+                # Cache-invalidation: if the caller asked for view_matrices
+                # but the cached .npz was written by an earlier run that
+                # used view_matrices=False, the load above silently
+                # leaves view_window_matrices unpopulated (or worse,
+                # overwrites them with sensor-window-matrix data when the
+                # view-key collides with a sensor-key like "FTG_ZN_1").
+                # calculate_view then produces a degenerate image and
+                # evalglare returns the noise-floor DGP (~0.018) without
+                # raising. Detect the mismatch and regenerate.
+                if view_matrices and self.view_window_matrices:
+                    sample = next(iter(self.view_window_matrices.values()))
+                    sender_key = next(iter(self.view_senders.keys()))
+                    sender = self.view_senders[sender_key]
+                    expected_npix = sender.xres * sender.yres
+                    needs_regen = (
+                        sample.array is None
+                        or sample.array.ndim < 2
+                        or sample.array.shape[1] != expected_npix
+                    )
+                    if needs_regen:
+                        logger.warning(
+                            "view_window_matrices loaded from cache %s have "
+                            "shape %s but view_matrices=True expects pixel "
+                            "count %d; deleting cache and regenerating.",
+                            self.mfile,
+                            None if sample.array is None else sample.array.shape,
+                            expected_npix,
+                        )
+                        self.mfile.unlink()
+                        # fall through to regeneration below
+                    else:
+                        return
+                else:
+                    return
         logger.info("Generating matrices (view_matrices=%s)...", view_matrices)
         logger.info("Step 1/5: Generating window matrices...")
         if view_matrices:
