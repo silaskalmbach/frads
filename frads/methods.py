@@ -1720,14 +1720,55 @@ class FivePhaseMethod(PhaseMethod):
             black_scene += pr.Xform(self.config.model.scene.bytes, modifier="black")()
         black = pr.Primitive("void", "plastic", "black", [], [0, 0, 0, 0, 0])
         glow = pr.Primitive("void", "glow", "glowing", [], [1, 1, 1, 0])
+
+        # Window polygons in the blacked_out_octree are required for
+        # V_d, D_d and (in aBSDF=0 path) C_ds matrices to capture the
+        # direct-sun path through the fenestration. Earlier versions
+        # excluded them (-> V_d.T.D_d.S_ds ≈ 0), which collapsed the
+        # 5PM anti-double-counting in McNeil 2013 to 3PM.
+        #
+        # Modifier choice trade-offs (see plan
+        # `analysier-alle-m-glichen-fehlerquellen-harmonic-petal.md`):
+        #   - "black": opaque, lets the rcontrib trace see the window as a
+        #     wall (no transmission). Closest to McNeil-2013 "subtract the
+        #     diffuse already counted in V.T.D" interpretation.
+        #   - "glowing": self-emissive, the window acts as a receiver for
+        #     rcontrib's sun-direction tracing. Matches the cdmap_oct
+        #     convention in _prepare_mapping_octrees.
+        # Env-Var FRADS_BLACKED_OCTREE_MODIFIER selects; default is "black"
+        # since McNeil 2013 §3.2 explicitly describes the subtraction term
+        # as "the direct sun contribution already counted in V.T.D"; a
+        # diffuse modifier would double-count. Phase-3 A/B-Validation
+        # decides whether glow performs better empirically.
+        modifier_mode = os.environ.get("FRADS_BLACKED_OCTREE_MODIFIER", "black")
+        if modifier_mode not in ("black", "glowing"):
+            raise ValueError(
+                f"FRADS_BLACKED_OCTREE_MODIFIER={modifier_mode!r} not in "
+                "{'black', 'glowing'}"
+            )
+        window_polys: list[bytes] = []
+        for _, sender in self.window_senders.items():
+            for surface in sender.surfaces:
+                # Re-emit each window primitive with the chosen modifier.
+                rewritten = pr.Primitive(
+                    modifier_mode,
+                    surface.ptype,
+                    surface.identifier,
+                    surface.sargs,
+                    surface.fargs,
+                )
+                window_polys.append(rewritten.bytes)
+        window_bytes = b"\n".join(window_polys)
+
         with open(self.blacked_out_octree, "wb") as f:
             f.write(
                 pr.oconv(
                     *self.config.model.materials.files,
-                    # *self.config.model.windows,
                     stdin=self.config.model.materials.bytes
                     + glow.bytes
                     + black.bytes
+                    + window_bytes
+                    + b"\n"
                     + black_scene,
                 )
             )
@@ -1773,15 +1814,39 @@ class FivePhaseMethod(PhaseMethod):
                 "FRADS_USE_ABSDF=1 but no Complex Fenestration State matrices "
                 "found in materials.matrices."
             )
-        # Verify each state has an XML; otherwise raise early.
+
+        # XML resolution: prefer tensor-tree when FRADS_USE_TT_T=1 (the
+        # T-matrix path uses tt-XMLs via dctimestep, so the aBSDF material
+        # must use the same convention). Fall back to per-state Klems XMLs
+        # when running the legacy V.T.D path (np.dot with the pyWinCalc
+        # Klems-145 matrix from materials.matrices.matrix_data). Mixing
+        # genBSDF-tt as aBSDF material with pyWinCalc-Klems-T would create
+        # a ~14x scaling mismatch between V.T.D.S and C_ds.S_sun.
+        use_tt_xmls = _tt_enabled()
+        def _resolve_xml(sk):
+            if use_tt_xmls:
+                try:
+                    return _tt_xml_for_state(sk)
+                except FileNotFoundError:
+                    logger.warning(
+                        "FRADS_USE_TT_T=1 but no tensor-tree XML for state %r "
+                        "in FRADS_TT_XML_DIR; falling back to Klems "
+                        "(peak extraction degenerate, see Geisler-Moroder BS2021).",
+                        sk,
+                    )
+            return xml_dir / f"{sk}_klems.xml"
+
+        # Verify each state has at least one of the candidate XMLs.
         missing: list[str] = []
         for sk in state_keys:
-            if not (xml_dir / f"{sk}_klems.xml").is_file():
-                missing.append(f"{sk}_klems.xml")
+            resolved = _resolve_xml(sk)
+            if not resolved.is_file():
+                missing.append(resolved.name)
         if missing:
             raise FileNotFoundError(
-                "FRADS_USE_ABSDF=1 requires per-state Klems XMLs in "
-                f"{xml_dir}; missing: {missing}"
+                "FRADS_USE_ABSDF=1 requires per-state BSDF XMLs in "
+                f"{xml_dir} (or FRADS_TT_XML_DIR when FRADS_USE_TT_T=1); "
+                f"missing: {missing}"
             )
 
         for pane_idx, pane_name in enumerate(pane_names):
@@ -1796,7 +1861,11 @@ class FivePhaseMethod(PhaseMethod):
                     modifier="black",
                 )()
             for state_key in state_keys:
-                xml_path = xml_dir / f"{state_key}_klems.xml"
+                xml_path = _resolve_xml(state_key)
+                logger.info(
+                    "[ABSDF_XML_BIND] pane=%d state=%s xml=%s (tt=%s)",
+                    pane_idx, state_key, xml_path.name, use_tt_xmls,
+                )
                 mat_name = f"absdf_p{pane_idx}_{state_key}".replace("-", "_")
                 absdf_prim = pr.Primitive(
                     "void",
@@ -2014,41 +2083,52 @@ class FivePhaseMethod(PhaseMethod):
         """
         if self.mfile.exists():
             if not self.config.settings.overwrite:
-                self.load_matrices()
-                # Cache-invalidation: if the caller asked for view_matrices
-                # but the cached .npz was written by an earlier run that
-                # used view_matrices=False, the load above silently
-                # leaves view_window_matrices unpopulated (or worse,
-                # overwrites them with sensor-window-matrix data when the
-                # view-key collides with a sensor-key like "FTG_ZN_1").
-                # calculate_view then produces a degenerate image and
-                # evalglare returns the noise-floor DGP (~0.018) without
-                # raising. Detect the mismatch and regenerate.
-                if view_matrices and self.view_window_matrices:
-                    sample = next(iter(self.view_window_matrices.values()))
-                    sender_key = next(iter(self.view_senders.keys()))
-                    sender = self.view_senders[sender_key]
-                    expected_npix = sender.xres * sender.yres
-                    needs_regen = (
-                        sample.array is None
-                        or sample.array.ndim < 2
-                        or sample.array.shape[1] != expected_npix
+                try:
+                    self.load_matrices()
+                except RuntimeError as exc:
+                    # Schema-version mismatch (e.g. cached `.npz` predates the
+                    # v2 namespacing fix). Drop the stale cache and fall through
+                    # to regenerate.
+                    logger.warning(
+                        "Cache %s could not be loaded (%s); deleting and "
+                        "regenerating.", self.mfile, exc,
                     )
-                    if needs_regen:
-                        logger.warning(
-                            "view_window_matrices loaded from cache %s have "
-                            "shape %s but view_matrices=True expects pixel "
-                            "count %d; deleting cache and regenerating.",
-                            self.mfile,
-                            None if sample.array is None else sample.array.shape,
-                            expected_npix,
+                    self.mfile.unlink()
+                else:
+                    # Cache-invalidation: if the caller asked for view_matrices
+                    # but the cached .npz was written by an earlier run that
+                    # used view_matrices=False, the load above silently
+                    # leaves view_window_matrices unpopulated (or worse,
+                    # overwrites them with sensor-window-matrix data when the
+                    # view-key collides with a sensor-key like "FTG_ZN_1").
+                    # calculate_view then produces a degenerate image and
+                    # evalglare returns the noise-floor DGP (~0.018) without
+                    # raising. Detect the mismatch and regenerate.
+                    if view_matrices and self.view_window_matrices:
+                        sample = next(iter(self.view_window_matrices.values()))
+                        sender_key = next(iter(self.view_senders.keys()))
+                        sender = self.view_senders[sender_key]
+                        expected_npix = sender.xres * sender.yres
+                        needs_regen = (
+                            sample.array is None
+                            or sample.array.ndim < 2
+                            or sample.array.shape[1] != expected_npix
                         )
-                        self.mfile.unlink()
-                        # fall through to regeneration below
+                        if needs_regen:
+                            logger.warning(
+                                "view_window_matrices loaded from cache %s have "
+                                "shape %s but view_matrices=True expects pixel "
+                                "count %d; deleting cache and regenerating.",
+                                self.mfile,
+                                None if sample.array is None else sample.array.shape,
+                                expected_npix,
+                            )
+                            self.mfile.unlink()
+                            # fall through to regeneration below
+                        else:
+                            return
                     else:
                         return
-                else:
-                    return
         logger.info("Generating matrices (view_matrices=%s)...", view_matrices)
         logger.info("Step 1/5: Generating window matrices...")
         if view_matrices:
@@ -2162,16 +2242,28 @@ class FivePhaseMethod(PhaseMethod):
         """ """
         logger.info(f"Loading matrices from {self.mfile}")
         mdata = np.load(self.mfile, allow_pickle=True)
+        schema_version = int(mdata["_schema_version"]) if "_schema_version" in mdata else 1
+        if schema_version < 2:
+            # Schema v1 stored view and sensor matrices under colliding keys
+            # (e.g. `FTG_ZN_1_window_matrix` for both view 'FTG_ZN_1' and
+            # sensor 'FTG_ZN_1'); the loader silently restored a degenerate
+            # view matrix. Force regeneration by raising to skip the
+            # short-circuit in generate_matrices.
+            raise RuntimeError(
+                f"Matrix cache schema v{schema_version} is incompatible with "
+                f"v2 namespacing (view/sensor keys collided); delete {self.mfile} "
+                "and re-run generate_matrices."
+            )
         for view, mtx in self.view_window_matrices.items():
-            mtx.array = mdata[f"{view}_window_matrix"]
+            mtx.array = mdata[f"view_{view}_window_matrix"]
         for sensor, mtx in self.sensor_window_matrices.items():
-            mtx.array = mdata[f"{sensor}_window_matrix"]
+            mtx.array = mdata[f"sensor_{sensor}_window_matrix"]
         for window, mtx in self.daylight_matrices.items():
             mtx.array = mdata[f"{window}_daylight_matrix"]
         for view, mtx in self.view_window_direct_matrices.items():
-            mtx.array = mdata[f"{view}_window_direct_matrix"]
+            mtx.array = mdata[f"view_{view}_window_direct_matrix"]
         for sensor, mtx in self.sensor_window_direct_matrices.items():
-            mtx.array = mdata[f"{sensor}_window_direct_matrix"]
+            mtx.array = mdata[f"sensor_{sensor}_window_direct_matrix"]
         for window, mtx in self.daylight_direct_matrices.items():
             mtx.array = mdata[f"{window}_daylight_direct_matrix"]
         if self._absdf:
@@ -2180,11 +2272,11 @@ class FivePhaseMethod(PhaseMethod):
             self._generate_absdf_sun_matrices(view_matrices=bool(self.view_sun_direct_matrices))
         else:
             for sensor, mtx in self.sensor_sun_direct_matrices.items():
-                mtx.array = mdata[f"{sensor}_sun_direct_matrix"]
+                mtx.array = mdata[f"sensor_{sensor}_sun_direct_matrix"]
             for view, mtx in self.view_sun_direct_matrices.items():
-                mtx.array = mdata[f"{view}_sun_direct_matrix"]
+                mtx.array = mdata[f"view_{view}_sun_direct_matrix"]
             for view, mtx in self.view_sun_direct_illuminance_matrices.items():
-                mtx.array = mdata[f"{view}_sun_direct_illuminance_matrix"]
+                mtx.array = mdata[f"view_{view}_sun_direct_illuminance_matrix"]
 
     def calculate_view(
         self,
@@ -2270,8 +2362,18 @@ class FivePhaseMethod(PhaseMethod):
             cdf_pane_dict = self.view_sun_direct_illuminance_matrices[view]
             for pane_idx, _name in enumerate(self.config.model.windows):
                 state_key = bsdf[pane_idx] if isinstance(bsdf, list) else bsdf[_name]
-                cdr_mtx = cdr_pane_dict[(pane_idx, state_key)]
-                cdf_mtx = cdf_pane_dict[(pane_idx, state_key)]
+                lookup_key = (pane_idx, state_key)
+                if lookup_key not in cdr_pane_dict:
+                    available = sorted(cdr_pane_dict.keys())
+                    raise KeyError(
+                        f"aBSDF view-pane state lookup failed in calculate_view: "
+                        f"({pane_idx!r}, {state_key!r}) not in cdr_pane_dict for view {view!r}; "
+                        f"available keys (first 10): {available[:10]}. "
+                        "Check that bsdf state names from get_cfs_state() match the "
+                        "materials.matrices keys used to build blacked_out_octrees."
+                    )
+                cdr_mtx = cdr_pane_dict[lookup_key]
+                cdf_mtx = cdf_pane_dict[lookup_key]
                 for c in range(3):
                     cdr = cdr_mtx.array[c].dot(direct_sun_sparse[c][:, :1])
                     cdf_raw = cdf_mtx.array[c].dot(direct_sun_sparse[c][:, :1])
@@ -2391,7 +2493,17 @@ class FivePhaseMethod(PhaseMethod):
             pane_dict = self.sensor_sun_direct_matrices[sensor]
             for pane_idx, _name in enumerate(self.config.model.windows):
                 state_key = bsdf[pane_idx] if isinstance(bsdf, list) else bsdf[_name]
-                mtx = pane_dict[(pane_idx, state_key)]
+                lookup_key = (pane_idx, state_key)
+                if lookup_key not in pane_dict:
+                    available = sorted(pane_dict.keys())
+                    raise KeyError(
+                        f"aBSDF sensor-pane state lookup failed in calculate_sensor: "
+                        f"({pane_idx!r}, {state_key!r}) not in pane_dict for sensor {sensor!r}; "
+                        f"available keys (first 10): {available[:10]}. "
+                        "Check that bsdf state names from get_cfs_state() match the "
+                        "materials.matrices keys used to build blacked_out_octrees."
+                    )
+                mtx = pane_dict[lookup_key]
                 for c, w in enumerate(weights):
                     cds = mtx.array[c].dot(direct_sun_sky_sparse[c][:, :1])
                     if hasattr(cds, "toarray"):
@@ -2701,17 +2813,25 @@ class FivePhaseMethod(PhaseMethod):
         return edgps, ev_value
 
     def save_matrices(self):
-        matrices = {}
+        # Schema v2 (2026-05-26): namespace view/sensor matrix keys to avoid
+        # collisions when a view-name and a sensor-name coincide (e.g. both
+        # using the zone name "FTG_ZN_1"). Prior schema wrote both under
+        # the same `{name}_window_matrix` key, so save_matrices silently
+        # overwrote the view-shape matrix with the sensor-shape one (and
+        # symmetrically for direct/sun variants). load_matrices then
+        # restored a degenerate view matrix and calculate_view rendered
+        # a near-black HDR, manifesting as the X18 noise-floor DGP bug.
+        matrices = {"_schema_version": np.int64(2)}
         for view, mtx in self.view_window_matrices.items():
-            matrices[f"{view}_window_matrix"] = mtx.array
+            matrices[f"view_{view}_window_matrix"] = mtx.array
         for sensor, mtx in self.sensor_window_matrices.items():
-            matrices[f"{sensor}_window_matrix"] = mtx.array
+            matrices[f"sensor_{sensor}_window_matrix"] = mtx.array
         for window, mtx in self.daylight_matrices.items():
             matrices[f"{window}_daylight_matrix"] = mtx.array
         for view, mtx in self.view_window_direct_matrices.items():
-            matrices[f"{view}_window_direct_matrix"] = mtx.array
+            matrices[f"view_{view}_window_direct_matrix"] = mtx.array
         for sensor, mtx in self.sensor_window_direct_matrices.items():
-            matrices[f"{sensor}_window_direct_matrix"] = mtx.array
+            matrices[f"sensor_{sensor}_window_direct_matrix"] = mtx.array
         for window, mtx in self.daylight_direct_matrices.items():
             matrices[f"{window}_daylight_direct_matrix"] = mtx.array
         if not self._absdf:
@@ -2719,11 +2839,11 @@ class FivePhaseMethod(PhaseMethod):
             # (see _generate_absdf_sun_matrices); keep them out of the bulk
             # .npz so the file stays comparable to upstream Frads.
             for sensor, mtx in self.sensor_sun_direct_matrices.items():
-                matrices[f"{sensor}_sun_direct_matrix"] = mtx.array
+                matrices[f"sensor_{sensor}_sun_direct_matrix"] = mtx.array
             for view, mtx in self.view_sun_direct_matrices.items():
-                matrices[f"{view}_sun_direct_matrix"] = mtx.array
+                matrices[f"view_{view}_sun_direct_matrix"] = mtx.array
             for view, mtx in self.view_sun_direct_illuminance_matrices.items():
-                matrices[f"{view}_sun_direct_illuminance_matrix"] = mtx.array
+                matrices[f"view_{view}_sun_direct_illuminance_matrix"] = mtx.array
         np.savez_compressed(self.mfile, **matrices)
 
 
