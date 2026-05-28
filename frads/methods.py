@@ -2217,12 +2217,17 @@ class FivePhaseMethod(PhaseMethod):
             )
             mtx.array = arr
 
-        for sensor_name, pane_dict in self.sensor_sun_direct_matrices.items():
-            for (pane_idx, state_key), mtx in pane_dict.items():
-                _generate_and_cache(
-                    "sensor_sun", sensor_name, mtx, ["-ab", "1"],
-                    pane_idx, state_key,
-                )
+        # FRADS_SKIP_ABSDF_SENSOR_SUN=1: skip the 120 sensor-Cds rcontrib calls
+        # (5 sensors x 4 panes x 6 states). Useful for view-only render scripts
+        # where calculate_sensor() is not needed (or is guarded by try/except).
+        # Saves ~5-7 h on first uncached run at sun_basis=r2 + disable_culling.
+        if os.environ.get("FRADS_SKIP_ABSDF_SENSOR_SUN") != "1":
+            for sensor_name, pane_dict in self.sensor_sun_direct_matrices.items():
+                for (pane_idx, state_key), mtx in pane_dict.items():
+                    _generate_and_cache(
+                        "sensor_sun", sensor_name, mtx, ["-ab", "1"],
+                        pane_idx, state_key,
+                    )
 
         if view_matrices:
             for view_name, pane_dict in self.view_sun_direct_matrices.items():
