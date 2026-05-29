@@ -38,6 +38,13 @@ from scipy.sparse import csr_matrix
 
 logger = logging.getLogger("frads.methods")
 
+# Captured at import, before any os.chdir() (FradsEnv chdirs into each job's
+# output_dir). The aBSDF Cds cache is anchored here so all sub-jobs launched
+# from the same start directory share one cache instead of fragmenting into
+# per-job <output_dir>/simulation/cache/cds/ trees (which forced redundant
+# recomputation of identical per-pane Cds matrices across the oracle sweep).
+_IMPORT_CWD = Path.cwd()
+
 
 def _absdf_enabled() -> bool:
     """True iff FRADS_USE_ABSDF=1 (Task-61 aBSDF + 5PM path active)."""
@@ -62,7 +69,7 @@ def _absdf_cache_dir() -> Path:
     """Disk cache for per-pane Cds matrices."""
     raw = os.environ.get(
         "FRADS_ABSDF_CACHE_DIR",
-        str(Path.cwd() / "simulation" / "cache" / "cds"),
+        str(_IMPORT_CWD / "simulation" / "cache" / "cds"),
     )
     p = Path(raw)
     p.mkdir(parents=True, exist_ok=True)
