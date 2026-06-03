@@ -177,6 +177,85 @@ class EnergyPlusModel(epmodel.EnergyPlusModel):
             ),
         )
 
+    def add_other_equipment(
+        self,
+        name: str,
+        zone: str,
+        design_level: float = 0.0,
+        *,
+        fraction_radiant: float = 0.6,
+        fraction_lost: float = 0.0,
+        schedule_name: str = "constant_on",
+        end_use_subcategory: str = "CFSDelayedGain",
+        replace: bool = False,
+    ):
+        """Add an OtherEquipment internal-gain object to a zone.
+
+        Intended to be actuated each timestep via the EnergyPlus
+        ``OtherEquipment`` / ``Power Level`` actuator (e.g. to deliver the
+        delayed absorbed-solar inward gain of a complex fenestration system,
+        see :mod:`frads.cfs_thermal`). ``design_level`` is only the initial
+        value; the runtime actuator overrides it (and may set it negative).
+
+        Args:
+            name: Unique OtherEquipment object name (used as the actuator key).
+            zone: Zone name to inject the gain into.
+            design_level: Initial power [W] (overridden at runtime).
+            fraction_radiant: Radiant fraction onto surfaces [0, 1].
+            fraction_lost: Lost fraction [0, 1] (keep 0 for energy conservation;
+                the remainder of 1 - radiant - lost is convective to the air).
+            schedule_name: Availability schedule (constant-on by default).
+            end_use_subcategory: End-use tracking label.
+            replace: Replace an existing object of the same name.
+
+        Raises:
+            ValueError: If the zone is not in the model, or the object already
+                exists and ``replace`` is False.
+        """
+        if self.zone is None:
+            raise ValueError("Zone not found in model.")
+        if zone not in self.zone:
+            raise ValueError(f"{zone} not found in model.")
+        if self.other_equipment is not None and name in self.other_equipment:
+            if replace:
+                del self.other_equipment[name]
+            else:
+                raise ValueError(
+                    f"OtherEquipment '{name}' already exists. To replace, set replace=True."
+                )
+
+        # Ensure the availability schedule exists (idempotent).
+        self.add(
+            "schedule_type_limits",
+            "on_off",
+            epm.ScheduleTypeLimits(
+                lower_limit_value=0,
+                upper_limit_value=1,
+                numeric_type=epm.NumericType.discrete,
+                unit_type=epm.UnitType.availability,
+            ),
+        )
+        self.add(
+            "schedule_constant",
+            schedule_name,
+            epm.ScheduleConstant(schedule_type_limits_name="on_off", hourly_value=1),
+        )
+        self.add(
+            "other_equipment",
+            name,
+            epm.OtherEquipment(
+                fuel_type=epm.FuelType.none,
+                zone_or_zonelist_or_space_or_spacelist_name=zone,
+                schedule_name=schedule_name,
+                design_level_calculation_method=epm.DesignLevelCalculationMethod2.equipment_level,
+                design_level=design_level,
+                fraction_radiant=fraction_radiant,
+                fraction_latent=0.0,
+                fraction_lost=fraction_lost,
+                end_use_subcategory=end_use_subcategory,
+            ),
+        )
+
     def add_output(
         self,
         output_type: str,
