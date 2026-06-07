@@ -1383,8 +1383,11 @@ class ThreePhaseMethod(PhaseMethod):
         Returns:
             A float value of illuminance
         """
-        # DEBUG: marker for ThreePhase calculate_sensor (with caller type)
-        print(f"[THREEPHASE_CALC_SENSOR_ENTRY] sensor={sensor} time={time} self_type={type(self).__name__}", flush=True)
+        # DEBUG: marker for ThreePhase calculate_sensor (gated — fires once per
+        # sensor per step; left ungated it produced a ~925 MB log over a long
+        # multi-env run. Enable with FRADS_SENSOR_DEBUG=1 when diagnosing.)
+        if os.environ.get("FRADS_SENSOR_DEBUG"):
+            print(f"[THREEPHASE_CALC_SENSOR_ENTRY] sensor={sensor} time={time} self_type={type(self).__name__}", flush=True)
         sky_matrix = self.get_sky_matrix(time, dni, dhi)
         res = []
         if isinstance(bsdf, list):
