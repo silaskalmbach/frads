@@ -125,6 +125,32 @@ def _tt_xml_for_state(state_key) -> Path:
     )
 
 
+def _resolve_absdf_xml(state_key) -> Path:
+    """Resolve the BSDF XML that parameterises the aBSDF material for a state.
+
+    Prefers the tensor-tree XML when FRADS_USE_TT_T=1; falls back to the
+    per-state Klems XML otherwise or when no tt-XML exists for the state.
+
+    Single source of truth for BOTH the per-pane octree construction
+    (_gen_per_pane_state_octrees) and the Cds disk-cache key
+    (_generate_absdf_sun_matrices): the cache key must hash the bytes of
+    the XML that actually built the octree, otherwise a FRADS_USE_TT_T=1
+    run silently reuses Klems-keyed cache entries and any tt-vs-Klems
+    A/B comparison reports "no difference".
+    """
+    if _tt_enabled():
+        try:
+            return _tt_xml_for_state(state_key)
+        except FileNotFoundError:
+            logger.warning(
+                "FRADS_USE_TT_T=1 but no tensor-tree XML for state %r "
+                "in FRADS_TT_XML_DIR; falling back to Klems "
+                "(peak extraction degenerate, see Geisler-Moroder BS2021).",
+                state_key,
+            )
+    return _absdf_xml_dir() / f"{state_key}_klems.xml"
+
+
 def _tt_cache_dir() -> Path:
     """Disk cache for combined V*T*D matrices baked via dctimestep."""
     raw = os.environ.get(
@@ -1832,24 +1858,14 @@ class FivePhaseMethod(PhaseMethod):
         # Klems-145 matrix from materials.matrices.matrix_data). Mixing
         # genBSDF-tt as aBSDF material with pyWinCalc-Klems-T would create
         # a ~14x scaling mismatch between V.T.D.S and C_ds.S_sun.
-        use_tt_xmls = _tt_enabled()
-        def _resolve_xml(sk):
-            if use_tt_xmls:
-                try:
-                    return _tt_xml_for_state(sk)
-                except FileNotFoundError:
-                    logger.warning(
-                        "FRADS_USE_TT_T=1 but no tensor-tree XML for state %r "
-                        "in FRADS_TT_XML_DIR; falling back to Klems "
-                        "(peak extraction degenerate, see Geisler-Moroder BS2021).",
-                        sk,
-                    )
-            return xml_dir / f"{sk}_klems.xml"
+        # Resolution logic lives in module-level _resolve_absdf_xml so the
+        # Cds cache key in _generate_absdf_sun_matrices hashes the same
+        # XML that builds these octrees.
 
         # Verify each state has at least one of the candidate XMLs.
         missing: list[str] = []
         for sk in state_keys:
-            resolved = _resolve_xml(sk)
+            resolved = _resolve_absdf_xml(sk)
             if not resolved.is_file():
                 missing.append(resolved.name)
         if missing:
@@ -1871,10 +1887,10 @@ class FivePhaseMethod(PhaseMethod):
                     modifier="black",
                 )()
             for state_key in state_keys:
-                xml_path = _resolve_xml(state_key)
+                xml_path = _resolve_absdf_xml(state_key)
                 logger.info(
                     "[ABSDF_XML_BIND] pane=%d state=%s xml=%s (tt=%s)",
-                    pane_idx, state_key, xml_path.name, use_tt_xmls,
+                    pane_idx, state_key, xml_path.name, _tt_enabled(),
                 )
                 mat_name = f"absdf_p{pane_idx}_{state_key}".replace("-", "_")
                 absdf_prim = pr.Primitive(
@@ -2197,9 +2213,11 @@ class FivePhaseMethod(PhaseMethod):
         def _key_parts(
             *, role: str, sender_name: str, pane_idx: int, state_key: str
         ) -> list[bytes]:
-            xml_bytes = (
-                _absdf_xml_dir() / f"{state_key}_klems.xml"
-            ).read_bytes()
+            # Hash the XML that actually built the octree (tt or Klems,
+            # via the shared resolver) -- NOT a hard-coded Klems path.
+            # TT off resolves to the identical Klems file, so legacy
+            # cache entries stay valid.
+            xml_bytes = _resolve_absdf_xml(state_key).read_bytes()
             return [
                 b"absdf-v1",
                 role.encode(),
