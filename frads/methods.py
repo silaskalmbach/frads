@@ -2468,8 +2468,10 @@ class FivePhaseMethod(PhaseMethod):
         Returns:
             ndarray of illuminance values [lux] for the sensor points.
         """
-        # DEBUG: visible marker at function entry
-        print(f"[FIVEPHASE_CALC_SENSOR_ENTRY] sensor={sensor} time={time}", flush=True)
+        # DEBUG: marker gated like the ThreePhase counterpart -- ungated it
+        # floods multi-million-step RL logs (925 MB precedent).
+        if os.environ.get("FRADS_SENSOR_DEBUG"):
+            print(f"[FIVEPHASE_CALC_SENSOR_ENTRY] sensor={sensor} time={time}", flush=True)
         weights = [47.4, 119.9, 11.6]
 
         sky_mfactor = int(self.config.settings.sky_basis[-1])
