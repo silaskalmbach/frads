@@ -2435,6 +2435,110 @@ class FivePhaseMethod(PhaseMethod):
                 + sun_scale * diag_cdr
                 + cdf_scale * diag_cdf)
 
+    def _rescd_rtrace_direct(self, sensor, bsdf, time, dni, dhi):
+        """Hybrid direct-sun (gated by FRADS_HYBRID_DIRECT): replace the
+        ALIASED matrix C_ds term with an explicit ``-ab0`` rtrace of the
+        continuous sun through each pane's aBSDF.
+
+        Why: the discrete sun-basis C_ds only fires when the sun lands in a
+        sun-patch that has a non-zero contribution to a near-facade POINT
+        sensor; otherwise it is 0 (the sun crosses a patch every ~25-30 min ->
+        the front sensor flickers 0/4000 and averages to the diffuse floor).
+        A continuous sun source has no such aliasing.
+
+        Summed over panes -- each ``blacked_out_octrees[(pane_idx, state)]``
+        isolates one pane's aBSDF with the rest blackened (no inter-reflection,
+        linear superposition, McNeil 2013 sec 3.2). Only the direct beam comes
+        from rtrace (``-ab0``; the octree's ``glow`` sky contributes nothing at
+        ``-ab0`` -> no double-count with the matrix diffuse res3). RGB->lux uses
+        the same ``[47.4, 119.9, 11.6]`` weights as the matrix path.
+        Cost ~8 ms / 5 points / pane -> RL-affordable.
+        """
+        import subprocess as _sp
+        import tempfile as _tf
+        pts = self.config.model.sensors[sensor].data
+        npts = len(pts)
+        if dni <= 0:
+            return np.zeros((npts, 1))
+        _bin = Path(pr.__file__).parent / "bin"
+        _env = dict(os.environ)
+        _env["RAYPATH"] = str(Path(pr.__file__).parent / "lib")
+        # One-time (per process) confirmation that the hybrid direct-trace is
+        # actually firing -> lets a long RL run be verified WITHOUT the flooding
+        # per-call debug marker. Omitting the FRADS_HYBRID_DIRECT/5PM stack would
+        # silently fall back to the matrix Cds with no such line.
+        if not getattr(FivePhaseMethod, "_hybrid_marker_logged", False):
+            print("[HYBRID_DIRECT_ACTIVE] 5PM-hybrid direct-trace firing "
+                  f"(first call sensor={sensor}); matrix Cds replaced by -ab0 rtrace.",
+                  flush=True)
+            FivePhaseMethod._hybrid_marker_logged = True
+        # rtrace flags: keep -ab0 (no ambient -> no sky-glow double-count with
+        # res3); tune source sampling (-dj jitter, -ds substructuring) to
+        # sample the sun disc through the sharp aBSDF peak. Override via env.
+        _flags = os.environ.get(
+            "FRADS_HYBRID_RTRACE_FLAGS", "-ab 0 -ds 0.02 -dt 0 -lr 8 -lw 1e-4"
+        ).split()
+        # STEP CACHE (RL speedup): the 4 per-pane sun-octrees depend only on
+        # (time, pane states), NOT on the sensor. The gym calls calculate_sensor
+        # once per sensor per step, so without caching we rebuild the sun +
+        # 4 octrees 5x per step. Cache them keyed by (time, states) -> gendaylit
+        # + oconv run once per step (5x fewer), only rtrace runs per sensor.
+        states = tuple(
+            bsdf[i] if isinstance(bsdf, list) else bsdf[n]
+            for i, n in enumerate(self.config.model.windows)
+        )
+        ckey = (time, states)
+        cache = getattr(self, "_hybrid_oct_cache", None)
+        if cache is None or cache[0] != ckey:
+            if cache is not None:
+                for _p in cache[1]:
+                    try:
+                        os.unlink(_p)
+                    except OSError:
+                        pass
+            md = self.wea_metadata
+            sky = pr.gendaylit(
+                time, md.latitude, md.longitude, md.timezone,
+                dirnorm=float(dni), diffhor=float(dhi), solar=True,
+            ).decode()
+            # keep only the solar light+source primitives (drop sky/ground so
+            # the diffuse stays exclusively in the matrix res3 term).
+            i0 = sky.find("void light solar")
+            i1 = sky.find("void brightfunc")
+            if i0 < 0 or i1 <= i0:
+                self._hybrid_oct_cache = (ckey, [])
+            else:
+                sun_rad = sky[i0:i1].encode()
+                octs = []
+                for pane_idx in range(len(self.config.model.windows)):
+                    sun_oct = pr.oconv(
+                        stdin=sun_rad,
+                        octree=self.blacked_out_octrees[(pane_idx, states[pane_idx])],
+                    )
+                    with _tf.NamedTemporaryFile(suffix=".oct", delete=False) as f:
+                        f.write(sun_oct)
+                        octs.append(f.name)
+                self._hybrid_oct_cache = (ckey, octs)
+            cache = self._hybrid_oct_cache
+        octs = cache[1]
+        if not octs:
+            return np.zeros((npts, 1))
+        rays = "".join(
+            f"{p[0]} {p[1]} {p[2]} {p[3]} {p[4]} {p[5]}\n" for p in pts
+        ).encode()
+        total = np.zeros((npts, 3))
+        for _octf in octs:
+            out = _sp.run(
+                [str(_bin / "rtrace"), "-I", "-h", *_flags, _octf],
+                input=rays, capture_output=True, env=_env,
+            )
+            for k, line in enumerate(out.stdout.decode().split("\n")):
+                v = line.split()
+                if len(v) >= 3 and k < npts:
+                    total[k] += [float(v[0]), float(v[1]), float(v[2])]
+        lux = total @ np.array([47.4, 119.9, 11.6])
+        return lux.reshape(-1, 1)
+
     def calculate_sensor(
         self,
         sensor: str,
@@ -2553,10 +2657,14 @@ class FivePhaseMethod(PhaseMethod):
                     cds = cds.toarray()
                 rescd += w * cds
 
+        if os.environ.get("FRADS_HYBRID_DIRECT"):
+            rescd = self._rescd_rtrace_direct(sensor, bsdf, time, dni, dhi)
         result = sky_scale * (res3 - res3d) + sun_scale * rescd
 
-        # DEBUG: visible marker that this code path runs
-        print(f"[CALC_SENSOR_5PM] sensor={sensor} time={time} env_breakdown={os.environ.get('FRADS_DEBUG_SENSOR_BREAKDOWN', 'NONE')}", flush=True)
+        # DEBUG: gated marker (was UNGATED -> floods multi-million-step RL logs,
+        # 925 MB precedent). Enable with FRADS_SENSOR_DEBUG=1 when diagnosing.
+        if os.environ.get("FRADS_SENSOR_DEBUG"):
+            print(f"[CALC_SENSOR_5PM] sensor={sensor} time={time} env_breakdown={os.environ.get('FRADS_DEBUG_SENSOR_BREAKDOWN', 'NONE')}", flush=True)
         # Optional sensor-component breakdown for 5PM validation tests.
         # Enabled by FRADS_DEBUG_SENSOR_BREAKDOWN=<csv-path>. One line appended per
         # call: time,sensor,res3,res3d,rescd,result,sky_scale,sun_scale,dni,dhi
