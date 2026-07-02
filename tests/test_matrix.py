@@ -79,7 +79,7 @@ class TestMatrix(unittest.TestCase):
     def test_sun_matrix_generate(self):
         """SunMatrix.generate() should populate self.array without error."""
         pts_list = [[0, 0, 0.8, 0, 0, 1]]
-        sender = matrix.SensorSender(pts_list, ray_cnt=1)
+        sender = matrix.SensorSender(pts_list, ray_count=1)
         receiver = matrix.SunReceiver("r1", full_mod=True)
         sun_mtx = matrix.SunMatrix(sender, receiver, octree=None)
         sun_mtx.generate(["-ab", "0"])
