@@ -634,8 +634,6 @@ class SunMatrix(Matrix):
         xres, yres = None, None
         inform = "a"
         parameters = list(parameters)
-        parameters.append("-n")
-        parameters.append(f"{nproc}")
         parameters.append("-h")
         if logger.getEffectiveLevel() > 20:
             parameters.append("-w")
@@ -657,17 +655,20 @@ class SunMatrix(Matrix):
                 inform = "f"
                 xres = self.sender.xres
                 yres = self.sender.yres
-            modifier = pr.RcModifier()
-            modifier.modifier_path = modifier_file
-            modifier.xres = xres
-            modifier.yres = yres
-            matrix = pr.rcontrib(
-                self.sender.content,
-                octree_file,
-                [modifier],
-                inform=inform,
-                outform="d",
-                params=parameters,
+            matrix = (
+                pr.Rcontrib(
+                    self.sender.content,
+                    octree_file,
+                    nproc=nproc,
+                    inform=inform,
+                    outform="d",
+                    params=parameters,
+                )
+                .add_modifier(
+                    modifier_path=modifier_file,
+                    xres=xres,
+                    yres=yres,
+                )()
             )
         if radmtx:
             return matrix

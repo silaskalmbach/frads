@@ -76,6 +76,19 @@ class TestMatrix(unittest.TestCase):
         receiver = matrix.SunReceiver(basis, smx_path, window_normals)
         assert receiver.basis == "r6"
 
+    def test_sun_matrix_generate(self):
+        """SunMatrix.generate() should populate self.array without error."""
+        pts_list = [[0, 0, 0.8, 0, 0, 1]]
+        sender = matrix.SensorSender(pts_list, ray_cnt=1)
+        receiver = matrix.SunReceiver("r1", full_mod=True)
+        sun_mtx = matrix.SunMatrix(sender, receiver, octree=None)
+        sun_mtx.generate(["-ab", "0"])
+        # array should be a 3-element tuple of sparse matrices (R, G, B)
+        assert sun_mtx.array is not None
+        assert sun_mtx.array.shape[0] == 3
+        # nrows == number of sensors, ncols == sun positions for r1 basis
+        assert sun_mtx.array[0].shape[0] == 1
+
     def test_surfaces_view_factor(self):
         mat = pr.Primitive(
             "void", "plastic", "mat", [], [0.5, 0.5, 0.5]
