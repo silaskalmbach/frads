@@ -150,6 +150,14 @@ class CFSThermalModel:
     ):
         if len(gaps) != len(panes) - 1:
             raise ValueError(f"expected {len(panes) - 1} gaps, got {len(gaps)}")
+        if absorptance_mode != "hemispherical":
+            raise NotImplementedError(
+                f"absorptance_mode={absorptance_mode!r} is not implemented; "
+                "only 'hemispherical' is supported. The 'angular' refinement "
+                "(map incidence cosine -> Klems polar band for the beam "
+                "fraction) was never wired up; previously it silently fell "
+                "back to the hemispherical average, yielding wrong absorptance."
+            )
         self.panes = panes
         self.gaps = gaps
         self.absorptance_mode = absorptance_mode
@@ -200,8 +208,10 @@ class CFSThermalModel:
         ]
 
     def alpha_for_step(self, incidence_cos: float | None = None) -> list[float]:
-        # Hemispherical default; angular mode is a (documented) refinement that
-        # would map incidence_cos -> Klems polar band for the beam fraction.
+        # Only the hemispherical average is implemented (enforced in __init__).
+        # An angular mode (incidence_cos -> Klems polar band for the beam
+        # fraction) would go here; ``incidence_cos`` is accepted for that future
+        # signature but is currently unused.
         return self._alpha_hemis
 
     # -- core --------------------------------------------------------------

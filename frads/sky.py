@@ -6,7 +6,6 @@ import datetime
 import logging
 import math
 import os
-import shutil
 import subprocess
 from pathlib import Path
 from typing import NamedTuple, Sequence
@@ -29,15 +28,18 @@ def gendaymtx_peak(
     the single Reinhart sky patch nearest the sun, with the energy scaled to
     suit the solar orb solid angle (parameter ``sun_apex_deg``). This is the
     canonical pre-processor for the ``C_ds * S_sun`` term of the McNeil-2013
-    5-phase method. pyradiance does not currently expose this flag, so we shell
-    out to the system ``gendaymtx`` binary.
+    5-phase method. We invoke the ``gendaymtx`` binary bundled with pyradiance
+    directly (resolved from ``pyradiance/bin``) rather than relying on the
+    ``PATH`` -- pyradiance only prepends its bin dir to ``PATH`` as an import
+    side effect, so ``shutil.which`` would be fragile.
 
     Args:
         wea_bytes: WEA-formatted weather data (full file content including
             header), bytes-encoded.
         mfactor: Reinhart subdivision factor (1=145 patches, 6=5185 patches).
         direct_only: Add ``-d`` to skip diffuse-sky contributions.
-        onesun: Add ``-O0`` for unit sun-radiance output.
+        onesun: Add ``-O0`` (gendaymtx's default output mode: radiometric,
+            full-spectrum radiance).
         sun_apex_deg: Sun apex angle in degrees (default 0.533, the visible
             solar disk).
 
@@ -45,15 +47,17 @@ def gendaymtx_peak(
         Raw matrix bytes (``-o d`` double-precision binary format).
 
     Raises:
-        FileNotFoundError: if ``gendaymtx`` is not on PATH.
+        FileNotFoundError: if the pyradiance ``gendaymtx`` binary is missing.
         subprocess.CalledProcessError: if ``gendaymtx`` fails.
     """
-    if shutil.which("gendaymtx") is None:
+    gendaymtx_bin = Path(pr.__file__).parent / "bin" / "gendaymtx"
+    if not gendaymtx_bin.is_file():
         raise FileNotFoundError(
-            "gendaymtx not found on PATH; install Radiance or extend PATH."
+            f"gendaymtx binary not found at {gendaymtx_bin}; "
+            "is pyradiance installed correctly?"
         )
     cmd: list[str] = [
-        "gendaymtx",
+        str(gendaymtx_bin),
         "-5", f"{sun_apex_deg}",
         "-od",
         "-h",

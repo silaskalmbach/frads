@@ -800,7 +800,15 @@ class EnergyPlusSetup:
         dhi = self.get_diffuse_horizontal_illuminance()
         sky_cover = self.get_total_sky_cover()
         view_name = next(iter(self.rconfigs[zone].model.views.keys()))
-        return self.rworkflows[zone].calculate_mev(
+        workflow = self.rworkflows[zone]
+        if not hasattr(workflow, "calculate_mev"):
+            raise RuntimeError(
+                f"calculate_mev is only implemented for ThreePhaseMethod; "
+                f"{type(workflow).__name__} (radiance_method='5phase') has "
+                "none. Use radiance_method='3phase' for melanopic Ev, or "
+                "calculate_edgps/calculate_dgp for glare."
+            )
+        return workflow.calculate_mev(
             view_name, cfs_name, date_time, dni, dhi, sky_cover
         )
 

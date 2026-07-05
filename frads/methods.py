@@ -77,13 +77,18 @@ def _absdf_cache_dir() -> Path:
 
 
 def _tt_enabled() -> bool:
-    """True iff FRADS_USE_TT_T=1 (tensor-tree T-matrix path active).
+    """True iff FRADS_USE_TT_T=1 (tensor-tree BSDF for the aBSDF material).
 
-    When enabled, the V*T*D multi-bounce path is evaluated via ``dctimestep``
-    against the tensor-tree BSDF XML (continuous Shirley-Chiu sampling)
-    instead of dense ``np.dot()`` with a Klems-145 T-matrix. Solves the
-    multi-bounce direct-sun patch quantization that drives the front-WPI
-    spike under Variante-B of the Task-61 high-resolution BSDF strategy.
+    Only effective together with FRADS_USE_ABSDF=1: it swaps the per-state
+    Klems XML for the tensor-tree XML used as the ``aBSDF`` material of the
+    per-pane blacked-out octrees (the ``Cds`` / direct-sun term), giving the
+    direct beam a continuous Shirley-Chiu-sampled BSDF instead of the
+    Klems-145 quantization that drives the front-WPI spike. It does NOT
+    reroute the V*T*D multi-bounce path through ``dctimestep``: that path is
+    still the dense ``np.dot()`` against the Klems T-matrix from
+    ``materials.matrices`` (a dctimestep tt-T path is not implemented here).
+    Without FRADS_USE_ABSDF=1 this flag has no effect and FivePhaseMethod
+    raises at construction rather than silently no-op'ing.
     """
     return os.environ.get("FRADS_USE_TT_T") == "1"
 
@@ -149,17 +154,6 @@ def _resolve_absdf_xml(state_key) -> Path:
                 state_key,
             )
     return _absdf_xml_dir() / f"{state_key}_klems.xml"
-
-
-def _tt_cache_dir() -> Path:
-    """Disk cache for combined V*T*D matrices baked via dctimestep."""
-    raw = os.environ.get(
-        "FRADS_TT_CACHE_DIR",
-        str(Path.cwd() / "simulation" / "cache" / "tt_vtd"),
-    )
-    p = Path(raw)
-    p.mkdir(parents=True, exist_ok=True)
-    return p
 
 
 def _rgb_to_rgbe(rgb: np.ndarray) -> np.ndarray:
@@ -240,7 +234,7 @@ def _parse_evalglare_dgp(out: "bytes | str") -> float:
 
 
 def _gendaymtx_direct_sky(
-    wea_bytes: bytes, sky_mfactor: int, absdf_mode: bool,
+    wea_bytes: bytes, sky_mfactor: int,
 ) -> np.ndarray:
     """Build the per-timestep direct-only sky vector S_ds.
 
@@ -279,7 +273,7 @@ def _gendaymtx_direct_sun(
             wea_bytes, outform="d", mfactor=sun_mfactor,
             header=False, sun_only=True, onesun=True,
         )
-    nrows = BASIS_DIMENSION.get(f"r{sun_mfactor}", 5165) + 1
+    nrows = BASIS_DIMENSION.get(f"r{sun_mfactor}", 5185) + 1
     return load_binary_matrix(smx, nrows=nrows, ncols=1, ncomp=3, dtype="d")
 
 
@@ -867,7 +861,26 @@ class PhaseMethod:
         self.octdir.mkdir(exist_ok=True)
         self.mtxdir = self.outdir / "Matrices"
         self.mtxdir.mkdir(exist_ok=True)
-        self.mfile = (self.mtxdir / self.config.hash_str).with_suffix(".npz")
+        # config.hash_str is frozen in WorkflowConfig.__post_init__, but the
+        # values that actually shape the persisted matrices are mutated
+        # afterwards (eplus.py sets settings.method, five_phase_wiring sets
+        # settings.sun_basis) or come from the environment (aBSDF, tt, blacked-
+        # octree modifier). Fold their effective-at-generation values into the
+        # filename so 3PM/5PM, r2/r6, aBSDF/non-aBSDF and black/glowing variants
+        # can never collide on the same .npz (which caused silent wrong Vd/Dd or
+        # an uncaught KeyError on load).
+        _eff_key = "|".join([
+            str(self.config.settings.method),
+            str(self.config.settings.sun_basis),
+            str(self.config.settings.sky_basis),
+            str(_absdf_enabled()),
+            os.environ.get("FRADS_BLACKED_OCTREE_MODIFIER", "black"),
+            str(_tt_enabled()),
+        ])
+        _eff_suffix = hashlib.md5(_eff_key.encode()).hexdigest()[:8]
+        self.mfile = (
+            self.mtxdir / f"{self.config.hash_str}_{_eff_suffix}"
+        ).with_suffix(".npz")
 
         # Generate a base octree
         self.octree = self.octdir / f"{random_string(5)}.oct"
@@ -1412,7 +1425,7 @@ class ThreePhaseMethod(PhaseMethod):
         # DEBUG: marker for ThreePhase calculate_sensor (gated — fires once per
         # sensor per step; left ungated it produced a ~925 MB log over a long
         # multi-env run. Enable with FRADS_SENSOR_DEBUG=1 when diagnosing.)
-        if os.environ.get("FRADS_SENSOR_DEBUG"):
+        if os.environ.get("FRADS_SENSOR_DEBUG") == "1":
             print(f"[THREEPHASE_CALC_SENSOR_ENTRY] sensor={sensor} time={time} self_type={type(self).__name__}", flush=True)
         sky_matrix = self.get_sky_matrix(time, dni, dhi)
         res = []
@@ -1716,6 +1729,24 @@ class FivePhaseMethod(PhaseMethod):
         # default mode keeps the single blacked_out_octree above.
         self.blacked_out_octrees: dict[tuple[int, str], Path] = {}
         self._absdf = _absdf_enabled()
+        self._hybrid_direct = os.environ.get("FRADS_HYBRID_DIRECT") == "1"
+        # Fail fast on flag combinations that would otherwise crash mid-run
+        # (first dni>0 timestep) inside the EnergyPlus ctypes callback, which
+        # swallows the exception and looks like a 600 s obs-queue deadlock.
+        if self._hybrid_direct and not self._absdf:
+            raise ValueError(
+                "FRADS_HYBRID_DIRECT=1 requires FRADS_USE_ABSDF=1: the hybrid "
+                "direct-sun rtrace samples the per-pane blacked-out octrees "
+                "that are only built in aBSDF mode. Set FRADS_USE_ABSDF=1 or "
+                "unset FRADS_HYBRID_DIRECT."
+            )
+        if _tt_enabled() and not self._absdf:
+            raise ValueError(
+                "FRADS_USE_TT_T=1 has no effect without FRADS_USE_ABSDF=1: the "
+                "tensor-tree XML is only consumed as the aBSDF material of the "
+                "per-pane octrees. Set FRADS_USE_ABSDF=1 or unset "
+                "FRADS_USE_TT_T."
+            )
         self.vmap_oct: Path = self.octdir / f"vmap_{random_string(5)}.oct"
         self.cdmap_oct: Path = self.octdir / f"cdmap_{random_string(5)}.oct"
         self.window_senders: dict[str, SurfaceSender] = {}
@@ -1851,13 +1882,14 @@ class FivePhaseMethod(PhaseMethod):
                 "found in materials.matrices."
             )
 
-        # XML resolution: prefer tensor-tree when FRADS_USE_TT_T=1 (the
-        # T-matrix path uses tt-XMLs via dctimestep, so the aBSDF material
-        # must use the same convention). Fall back to per-state Klems XMLs
-        # when running the legacy V.T.D path (np.dot with the pyWinCalc
-        # Klems-145 matrix from materials.matrices.matrix_data). Mixing
-        # genBSDF-tt as aBSDF material with pyWinCalc-Klems-T would create
-        # a ~14x scaling mismatch between V.T.D.S and C_ds.S_sun.
+        # XML resolution: prefer tensor-tree when FRADS_USE_TT_T=1. The tt-XML
+        # is used as the aBSDF material of these per-pane octrees (the Cds /
+        # direct-sun term traced by rcontrib/rtrace); it does NOT reroute the
+        # V.T.D multi-bounce path, which stays dense np.dot against the
+        # Klems-145 T-matrix from materials.matrices.matrix_data regardless.
+        # Fall back to per-state Klems XMLs otherwise. Mixing genBSDF-tt as
+        # aBSDF material with pyWinCalc-Klems-T would create a ~14x scaling
+        # mismatch between V.T.D.S and C_ds.S_sun.
         # Resolution logic lives in module-level _resolve_absdf_xml so the
         # Cds cache key in _generate_absdf_sun_matrices hashes the same
         # XML that builds these octrees.
@@ -2110,7 +2142,7 @@ class FivePhaseMethod(PhaseMethod):
         if self.mfile.exists():
             if not self.config.settings.overwrite:
                 try:
-                    self.load_matrices()
+                    self.load_matrices(view_matrices=view_matrices)
                 except RuntimeError as exc:
                     # Schema-version mismatch (e.g. cached `.npz` predates the
                     # v2 namespacing fix). Drop the stale cache and fall through
@@ -2209,22 +2241,45 @@ class FivePhaseMethod(PhaseMethod):
         """
         cache_dir = _absdf_cache_dir()
         nproc = self.config.settings.num_processors
+        # WEA/EPW identity: sun_culling nulls the SunReceiver columns using the
+        # annual sun matrix, so the generated Cds array depends on the weather
+        # file. Hash it once for all keys in this call.
+        wea_hash = hashlib.sha256(
+            (getattr(self, "wea_str", None) or "").encode()
+        ).digest()
 
         def _key_parts(
             *, role: str, sender_name: str, pane_idx: int, state_key: str
         ) -> list[bytes]:
-            # Hash the XML that actually built the octree (tt or Klems,
-            # via the shared resolver) -- NOT a hard-coded Klems path.
-            # TT off resolves to the identical Klems file, so legacy
-            # cache entries stay valid.
+            # absdf-v2 key: cover EVERY input that changes the generated Cds
+            # array. (v1 only hashed role/sender-NAME/pane/state/sun_basis/xml,
+            # so a moved sensor, a changed view, a geometry/modifier/rotation
+            # edit, the sun_culling flag or a different EPW silently reused a
+            # stale matrix. Bumping the prefix also invalidates all v1 entries.)
             xml_bytes = _resolve_absdf_xml(state_key).read_bytes()
+            # The compiled per-pane octree captures scene + window geometry, the
+            # blacked-octree modifier (black/glowing) and the bound XML path in
+            # a single hash.
+            octree_bytes = self.blacked_out_octrees[
+                (pane_idx, state_key)
+            ].read_bytes()
+            # Sender content = sensor point coords+directions (role sensor) or
+            # the view position/direction/resolution (role view).
+            if role.startswith("sensor"):
+                sender_bytes = self.sensor_senders[sender_name].content
+            else:
+                sender_bytes = self.view_senders[sender_name].content
             return [
-                b"absdf-v1",
+                b"absdf-v2",
                 role.encode(),
                 sender_name.encode(),
                 str(pane_idx).encode(),
                 state_key.encode(),
                 self.config.settings.sun_basis.encode(),
+                b"sun_culling=" + str(self.config.settings.sun_culling).encode(),
+                wea_hash,
+                sender_bytes,
+                octree_bytes,
                 xml_bytes,
             ]
 
@@ -2249,7 +2304,14 @@ class FivePhaseMethod(PhaseMethod):
         # (5 sensors x 4 panes x 6 states). Useful for view-only render scripts
         # where calculate_sensor() is not needed (or is guarded by try/except).
         # Saves ~5-7 h on first uncached run at sun_basis=r2 + disable_culling.
-        if os.environ.get("FRADS_SKIP_ABSDF_SENSOR_SUN") != "1":
+        # Hybrid mode (FRADS_HYBRID_DIRECT=1) replaces the matrix Cds with an
+        # rtrace in calculate_sensor, so the sensor Cds product is never used --
+        # skip its generation implicitly to avoid the wasted init hours.
+        skip_sensor_sun = (
+            os.environ.get("FRADS_SKIP_ABSDF_SENSOR_SUN") == "1"
+            or self._hybrid_direct
+        )
+        if not skip_sensor_sun:
             for sensor_name, pane_dict in self.sensor_sun_direct_matrices.items():
                 for (pane_idx, state_key), mtx in pane_dict.items():
                     _generate_and_cache(
@@ -2271,8 +2333,17 @@ class FivePhaseMethod(PhaseMethod):
                         pane_idx, state_key,
                     )
 
-    def load_matrices(self):
-        """ """
+    def load_matrices(self, view_matrices: bool = True):
+        """Restore matrices from the ``.npz`` cache.
+
+        ``view_matrices`` mirrors ``generate_matrices``: when False the caller
+        (e.g. sensor-only ``initialize_radiance``) does not want view matrices,
+        so we neither load them nor force their (expensive) aBSDF Cds
+        regeneration. Previously the aBSDF branch keyed generation off
+        ``bool(self.view_sun_direct_matrices)`` -- always truthy when any view
+        is configured -- which forced a full view-Cds rebuild on every warm-
+        cache process start even for sensor-only runs.
+        """
         logger.info(f"Loading matrices from {self.mfile}")
         mdata = np.load(self.mfile, allow_pickle=True)
         schema_version = int(mdata["_schema_version"]) if "_schema_version" in mdata else 1
@@ -2287,14 +2358,16 @@ class FivePhaseMethod(PhaseMethod):
                 f"v2 namespacing (view/sensor keys collided); delete {self.mfile} "
                 "and re-run generate_matrices."
             )
-        for view, mtx in self.view_window_matrices.items():
-            mtx.array = mdata[f"view_{view}_window_matrix"]
+        if view_matrices:
+            for view, mtx in self.view_window_matrices.items():
+                mtx.array = mdata[f"view_{view}_window_matrix"]
         for sensor, mtx in self.sensor_window_matrices.items():
             mtx.array = mdata[f"sensor_{sensor}_window_matrix"]
         for window, mtx in self.daylight_matrices.items():
             mtx.array = mdata[f"{window}_daylight_matrix"]
-        for view, mtx in self.view_window_direct_matrices.items():
-            mtx.array = mdata[f"view_{view}_window_direct_matrix"]
+        if view_matrices:
+            for view, mtx in self.view_window_direct_matrices.items():
+                mtx.array = mdata[f"view_{view}_window_direct_matrix"]
         for sensor, mtx in self.sensor_window_direct_matrices.items():
             mtx.array = mdata[f"sensor_{sensor}_window_direct_matrix"]
         for window, mtx in self.daylight_direct_matrices.items():
@@ -2302,14 +2375,15 @@ class FivePhaseMethod(PhaseMethod):
         if self._absdf:
             # aBSDF sun matrices live in their own disk cache (per pane*state);
             # the bulk .npz only carries the diffuse + window matrices above.
-            self._generate_absdf_sun_matrices(view_matrices=bool(self.view_sun_direct_matrices))
+            self._generate_absdf_sun_matrices(view_matrices=view_matrices)
         else:
             for sensor, mtx in self.sensor_sun_direct_matrices.items():
                 mtx.array = mdata[f"sensor_{sensor}_sun_direct_matrix"]
-            for view, mtx in self.view_sun_direct_matrices.items():
-                mtx.array = mdata[f"view_{view}_sun_direct_matrix"]
-            for view, mtx in self.view_sun_direct_illuminance_matrices.items():
-                mtx.array = mdata[f"view_{view}_sun_direct_illuminance_matrix"]
+            if view_matrices:
+                for view, mtx in self.view_sun_direct_matrices.items():
+                    mtx.array = mdata[f"view_{view}_sun_direct_matrix"]
+                for view, mtx in self.view_sun_direct_illuminance_matrices.items():
+                    mtx.array = mdata[f"view_{view}_sun_direct_illuminance_matrix"]
 
     def calculate_view(
         self,
@@ -2352,7 +2426,7 @@ class FivePhaseMethod(PhaseMethod):
         _wea_str = self.wea_header + str(WeaData(time, dni, dhi))
 
         direct_sky = _gendaymtx_direct_sky(
-            _wea_str.encode(), sky_mfactor, self._absdf,
+            _wea_str.encode(), sky_mfactor,
         )
         direct_sky_sparse = to_sparse_matrix3(direct_sky)
 
@@ -2497,9 +2571,17 @@ class FivePhaseMethod(PhaseMethod):
                     except OSError:
                         pass
             md = self.wea_metadata
+            # NOTE: no solar=True here. solar=True sets gendaylit -O1 (solar
+            # radiance, full-spectrum W/m^2sr), but the RGB->lux conversion
+            # below applies the photometric weights [47.4, 119.9, 11.6], which
+            # assume VISIBLE radiance -- the same convention the matrix Cds
+            # path uses (its Ssun comes from gendaymtx at -O0). With solar=True
+            # the direct term was inflated by the solar/visible ratio (~1.7-2.2
+            # depending on sky), term-selectively over-weighting beam-dominated
+            # hours. The "void light solar" block is emitted at -O0 too.
             sky = pr.gendaylit(
                 time, md.latitude, md.longitude, md.timezone,
-                dirnorm=float(dni), diffhor=float(dhi), solar=True,
+                dirnorm=float(dni), diffhor=float(dhi),
             ).decode()
             # keep only the solar light+source primitives (drop sky/ground so
             # the diffuse stays exclusively in the matrix res3 term).
@@ -2532,10 +2614,38 @@ class FivePhaseMethod(PhaseMethod):
                 [str(_bin / "rtrace"), "-I", "-h", *_flags, _octf],
                 input=rays, capture_output=True, env=_env,
             )
-            for k, line in enumerate(out.stdout.decode().split("\n")):
+            if out.returncode != 0:
+                # A silent failure here (bad FRADS_HYBRID_RTRACE_FLAGS, missing
+                # octree, RAYPATH issue) would leave total==0, i.e. a permanent
+                # zero direct-sun term looking exactly like the aliasing this
+                # hybrid path exists to fix. Fail loudly instead.
+                raise RuntimeError(
+                    f"rtrace failed (rc={out.returncode}) in hybrid direct-sun "
+                    f"trace for sensor {sensor!r} at {time}; flags={_flags}; "
+                    f"stderr: {out.stderr.decode(errors='replace')[:500]}"
+                )
+            # Parse only lines that carry >=3 parseable floats, assigning them
+            # to sensor points in order -- robust against any stray diagnostic
+            # line rather than trusting a raw enumerate() index.
+            k = 0
+            for line in out.stdout.decode().split("\n"):
                 v = line.split()
-                if len(v) >= 3 and k < npts:
-                    total[k] += [float(v[0]), float(v[1]), float(v[2])]
+                if len(v) < 3:
+                    continue
+                try:
+                    rgb = [float(v[0]), float(v[1]), float(v[2])]
+                except ValueError:
+                    continue
+                if k >= npts:
+                    break
+                total[k] += rgb
+                k += 1
+            if k != npts:
+                raise RuntimeError(
+                    f"rtrace returned {k} value rows but expected {npts} for "
+                    f"sensor {sensor!r} at {time}; stdout head: "
+                    f"{out.stdout.decode(errors='replace')[:200]!r}"
+                )
         lux = total @ np.array([47.4, 119.9, 11.6])
         return lux.reshape(-1, 1)
 
@@ -2574,7 +2684,7 @@ class FivePhaseMethod(PhaseMethod):
         """
         # DEBUG: marker gated like the ThreePhase counterpart -- ungated it
         # floods multi-million-step RL logs (925 MB precedent).
-        if os.environ.get("FRADS_SENSOR_DEBUG"):
+        if os.environ.get("FRADS_SENSOR_DEBUG") == "1":
             print(f"[FIVEPHASE_CALC_SENSOR_ENTRY] sensor={sensor} time={time}", flush=True)
         weights = [47.4, 119.9, 11.6]
 
@@ -2585,7 +2695,7 @@ class FivePhaseMethod(PhaseMethod):
         _wea_str = self.wea_header + str(WeaData(time, dni, dhi))
 
         direct_sky_matrix = _gendaymtx_direct_sky(
-            _wea_str.encode(), sky_mfactor, self._absdf,
+            _wea_str.encode(), sky_mfactor,
         )
         direct_sky_matrix_sparse = to_sparse_matrix3(direct_sky_matrix)
 
@@ -2626,9 +2736,16 @@ class FivePhaseMethod(PhaseMethod):
             res3d += _res_d
 
         # rescd: direct sun component via high-res sun coefficients.
-        # aBSDF path: sum over panes, each with its current state's Cds matrix.
+        # Hybrid mode (FRADS_HYBRID_DIRECT=1) replaces the matrix Cds entirely
+        # with an rtrace of the continuous sun, so the per-pane matrix Cds loop
+        # is skipped rather than computed-and-discarded (it is never used, and
+        # the sensor Cds matrices may be intentionally ungenerated -- see
+        # _generate_absdf_sun_matrices skip logic).
         rescd = np.zeros((self.sensor_senders[sensor].yres, 1))
-        if self._absdf:
+        if self._hybrid_direct:
+            rescd = self._rescd_rtrace_direct(sensor, bsdf, time, dni, dhi)
+        elif self._absdf:
+            # aBSDF path: sum over panes, each with its current state's Cds matrix.
             pane_dict = self.sensor_sun_direct_matrices[sensor]
             for pane_idx, _name in enumerate(self.config.model.windows):
                 state_key = bsdf[pane_idx] if isinstance(bsdf, list) else bsdf[_name]
@@ -2657,13 +2774,11 @@ class FivePhaseMethod(PhaseMethod):
                     cds = cds.toarray()
                 rescd += w * cds
 
-        if os.environ.get("FRADS_HYBRID_DIRECT"):
-            rescd = self._rescd_rtrace_direct(sensor, bsdf, time, dni, dhi)
         result = sky_scale * (res3 - res3d) + sun_scale * rescd
 
         # DEBUG: gated marker (was UNGATED -> floods multi-million-step RL logs,
         # 925 MB precedent). Enable with FRADS_SENSOR_DEBUG=1 when diagnosing.
-        if os.environ.get("FRADS_SENSOR_DEBUG"):
+        if os.environ.get("FRADS_SENSOR_DEBUG") == "1":
             print(f"[CALC_SENSOR_5PM] sensor={sensor} time={time} env_breakdown={os.environ.get('FRADS_DEBUG_SENSOR_BREAKDOWN', 'NONE')}", flush=True)
         # Optional sensor-component breakdown for 5PM validation tests.
         # Enabled by FRADS_DEBUG_SENSOR_BREAKDOWN=<csv-path>. One line appended per
@@ -2688,6 +2803,14 @@ class FivePhaseMethod(PhaseMethod):
         return result.flatten()
 
     def calculate_view_from_wea(self, view: str):
+        if self._absdf:
+            raise NotImplementedError(
+                "calculate_view_from_wea does not support aBSDF mode: "
+                "view_sun_direct_matrices is a per-(pane, state) dict, not a "
+                "SunMatrix, and the aBSDF direct-sun path is only defined "
+                "per-timestep. Use the per-timestep calculate_view / "
+                "calculate_dgp API, or run non-aBSDF 5PM for the annual path."
+            )
         logger.info("Step 1/2: Generating sky matrix from wea")
         sky_matrix = self.get_sky_matrix_from_wea(
             int(self.config.settings.sky_basis[-1])
@@ -2750,6 +2873,14 @@ class FivePhaseMethod(PhaseMethod):
         return res
 
     def calculate_sensor_from_wea(self, sensor):
+        if self._absdf:
+            raise NotImplementedError(
+                "calculate_sensor_from_wea does not support aBSDF mode: "
+                "sensor_sun_direct_matrices is a per-(pane, state) dict, not a "
+                "SunMatrix, and the aBSDF direct-sun path is only defined "
+                "per-timestep. Use the per-timestep calculate_sensor API, or "
+                "run non-aBSDF 5PM for the annual path."
+            )
         sky_matrix = self.get_sky_matrix_from_wea(
             int(self.config.settings.sky_basis[-1])
         )
