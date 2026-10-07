@@ -233,6 +233,18 @@ def _parse_evalglare_dgp(out: "bytes | str") -> float:
     raise RuntimeError(f"evalglare produced no parseable DGP. stdout: {text!r}")
 
 
+def _sky_rotation() -> float:
+    """FRADS_SKY_ROTATION in Grad (gendaymtx -r / xform -rz, gegen den Uhrzeigersinn von oben).
+
+    Holt die IDF-Nordachse nach, die die Radiance-Kette sonst nicht anwendet (W17 D1,
+    docs/analysis/diss-korrektur/w17-riegel-ursache.md): Nordachse 5 Grad im Uhrzeigersinn
+    -> FRADS_SKY_ROTATION=5. Unset/0 = bisheriges Verhalten. Gilt fuer Himmelsmatrix S, Sd
+    und die Hybrid-Direktsonne; Pfade mit Sonnenkoeffizienten-Matrizen (Cds) sind nicht
+    gedreht und brechen bei gesetzter Drehung ab.
+    """
+    return float(os.environ.get("FRADS_SKY_ROTATION") or 0.0)
+
+
 def _gendaymtx_direct_sky(
     wea_bytes: bytes, sky_mfactor: int,
 ) -> np.ndarray:
@@ -249,7 +261,7 @@ def _gendaymtx_direct_sky(
     """
     smx = pr.gendaymtx(
         wea_bytes, outform="d", mfactor=sky_mfactor,
-        header=False, sun_only=True,
+        header=False, sun_only=True, rotate=_sky_rotation() or None,
     )
     nrows = BASIS_DIMENSION.get(f"r{sky_mfactor}", 145) + 1
     return load_binary_matrix(smx, nrows=nrows, ncols=1, ncomp=3, dtype="d")
@@ -967,7 +979,7 @@ class PhaseMethod:
             mfactor=int(self.config.settings.sky_basis[-1]),
             header=False,
             solar_radiance=solar_spectrum,
-            rotate=orient,
+            rotate=orient or _sky_rotation(),
         )
         return load_binary_matrix(
             smx,
@@ -2419,6 +2431,9 @@ class FivePhaseMethod(PhaseMethod):
         Returns:
             ndarray of shape ``(npixels, 1, 3)`` with per-pixel RGB radiance.
         """
+        if _sky_rotation():
+            raise NotImplementedError(
+                "FRADS_SKY_ROTATION ist fuer den Bildpfad nicht umgesetzt (Cds/Cdf ungedreht)")
         sky_mfactor = int(self.config.settings.sky_basis[-1])
         sun_mfactor = int(self.config.settings.sun_basis[-1])
 
@@ -2591,6 +2606,8 @@ class FivePhaseMethod(PhaseMethod):
                 self._hybrid_oct_cache = (ckey, [])
             else:
                 sun_rad = sky[i0:i1].encode()
+                if _sky_rotation():
+                    sun_rad = pr.Xform(sun_rad).rotatez(_sky_rotation())()
                 octs = []
                 for pane_idx in range(len(self.config.model.windows)):
                     sun_oct = pr.oconv(
@@ -2687,6 +2704,9 @@ class FivePhaseMethod(PhaseMethod):
         if os.environ.get("FRADS_SENSOR_DEBUG") == "1":
             print(f"[FIVEPHASE_CALC_SENSOR_ENTRY] sensor={sensor} time={time}", flush=True)
         weights = [47.4, 119.9, 11.6]
+        if _sky_rotation() and not self._hybrid_direct:
+            raise NotImplementedError(
+                "FRADS_SKY_ROTATION verlangt FRADS_HYBRID_DIRECT=1 (Cds-Matrizen sind ungedreht)")
 
         sky_mfactor = int(self.config.settings.sky_basis[-1])
         sun_mfactor = int(self.config.settings.sun_basis[-1])
