@@ -1,8 +1,10 @@
 """Convert an EnergyPlus epJSON file into Radiance model[s]."""
 
 from dataclasses import dataclass
+import json
 import logging
 import math
+import os
 
 import pyradiance as pr
 import numpy as np
@@ -435,6 +437,61 @@ def exterior_shading_to_polygon(srf: ShadingZoneDetailed) -> Polygon:
     return Polygon(vertex)
 
 
+def _fassade_override(name: str) -> dict | None:
+    """FRADS_FASSADE (JSON, {"<Wand>": {...}}) ueberschreibt die Fassadenextrusion einer Wand (W17 D2).
+
+    Ohne die Variable bleibt alles wie bisher: jede Fensteroeffnung wird einzeln mit der vollen
+    Konstruktionsdicke extrudiert, sodass Stege zwischen benachbarten Scheiben als tiefe Wandstuecke
+    entstehen. Mit Override wird die Leibung nur um den Aussenrand des Glasfelds (Huelle aller Fenster
+    der Wand) gelegt, Tiefe "aussen" (m, nach aussen) und "innen" (m, in den Raum; Sensorabstaende
+    zaehlen ab der Glasebene), und die Luecken zwischen den Scheiben werden als Profil von
+    "profil_innen" bis "profil_aussen" (m) um die Glasebene modelliert. Rekalibrierung 2026-10-07.
+    """
+    spec = os.environ.get("FRADS_FASSADE")
+    return json.loads(spec).get(name) if spec else None
+
+
+def _fassade_flaechen(wall: Polygon, windows: list[Polygon], ov: dict) -> list[tuple[Polygon, str]]:
+    """Flaechen (Polygon, Rolle) fuer den Fassaden-Override; Rolle ext/sill/sillin/innen/profil."""
+    n = wall.normal
+    v0 = wall.vertices[0]
+    u = wall.vertices[1] - v0
+    u = u / np.linalg.norm(u)
+    w = np.cross(n, u)
+    rect_ab = []
+    for win in windows:
+        a, b = (win.vertices - v0) @ u, (win.vertices - v0) @ w
+        rect_ab.append((a.min(), a.max(), b.min(), b.max()))
+    off = float(np.mean([(win.vertices - v0) @ n for win in windows]))
+
+    def rect(a0, a1, b0, b1):
+        return Polygon([v0 + u * a0 + w * b0 + n * off, v0 + u * a1 + w * b0 + n * off,
+                        v0 + u * a1 + w * b1 + n * off, v0 + u * a0 + w * b1 + n * off])
+
+    a_min, a_max = min(r[0] for r in rect_ab), max(r[1] for r in rect_ab)
+    b_min, b_max = min(r[2] for r in rect_ab), max(r[3] for r in rect_ab)
+    feld = rect(a_min, a_max, b_min, b_max)
+    wand = Polygon(list(wall.vertices)) - feld
+    out = []
+    ext = thicken(wand, [feld], float(ov["aussen"]))
+    out.append((ext[1], "ext"))
+    out += [(f, "sill") for f in ext[2:]]
+    innen = float(ov.get("innen", 0.0))
+    if innen > 0:
+        out += [(f, "sillin") for f in feld.extrude(-n * innen)[2:]]
+        out.append((wand.move(-n * innen), "innen"))
+    pa, pi = float(ov.get("profil_aussen", 0.0)), float(ov.get("profil_innen", 0.0))
+    if pa + pi > 0:
+        def luecken(intervalle):
+            iv = sorted(set((round(x0, 6), round(x1, 6)) for x0, x1 in intervalle))
+            return [(iv[i][1], iv[i + 1][0]) for i in range(len(iv) - 1) if iv[i + 1][0] - iv[i][1] > 1e-6]
+        streifen = [rect(g0, g1, b_min, b_max) for g0, g1 in luecken([(r[0], r[1]) for r in rect_ab])]
+        streifen += [rect(a_min, a_max, g0, g1) for g0, g1 in luecken([(r[2], r[3]) for r in rect_ab])]
+        for st in streifen:
+            out += [(f, "profil") for f in st.move(-n * pi).extrude(n * (pa + pi))]
+    return out
+
+
 def thicken(
     surface: Polygon,
     windows: list[Polygon],
@@ -757,6 +814,7 @@ class EnergyPlusToRadianceModelConverter:
         opaque_surface_name = surface_name.replace(" ", "_")
         if not check_outward(surface_polygon, zone_center):
             surface_polygon = surface_polygon.flip()
+        wand_voll = surface_polygon
         for fname, fene in fenestrations.items():
             fenestration_polygon, window = self._process_fenestration(
                 fname, fene, zone_center
@@ -785,7 +843,16 @@ class EnergyPlusToRadianceModelConverter:
             )
 
         # extrude the surface by thickness
-        if fenestrations != {}:
+        ov = _fassade_override(opaque_surface_name) if fenestrations != {} else None
+        if ov is not None:
+            zaehler: dict[str, int] = {}
+            for poly, rolle in _fassade_flaechen(wand_voll, window_polygons, ov):
+                zaehler[rolle] = zaehler.get(rolle, 0) + 1
+                ident = (f"ext_{opaque_surface_name}" if rolle == "ext"
+                         else f"{rolle}_{opaque_surface_name}.{zaehler[rolle]}")
+                mat = outer_material_name if rolle == "ext" else inner_material_name
+                scene.append(polygon_primitive(poly, mat, ident).bytes)
+        elif fenestrations != {}:
             facade = thicken(surface_polygon, window_polygons, construction.thickness)
             scene.append(
                 polygon_primitive(
